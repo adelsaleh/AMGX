@@ -141,6 +141,8 @@ class EigenSolver
 
         float m_setup_time;
         float m_solve_time;
+        float m_setup_time_for_solve;
+        bool m_setup_time_pending;
 
         int m_ref_count;
 

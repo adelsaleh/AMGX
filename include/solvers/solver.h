@@ -18,6 +18,15 @@ template<class T_config> class Scaler;
 namespace amgx
 {
 
+enum MonitoredResidualKind
+{
+    MONITORED_RESIDUAL_EXPLICIT,
+    MONITORED_RESIDUAL_RECURSIVE,
+    MONITORED_RESIDUAL_ARNOLDI_ESTIMATE,
+    MONITORED_RESIDUAL_RECURSIVE_VERIFIED,
+    MONITORED_RESIDUAL_ARNOLDI_VERIFIED
+};
+
 template<class TConfig>
 class Solver : public AuxData
 {
@@ -168,6 +177,10 @@ class Solver : public AuxData
         // Print the solver settings
         virtual void printSolverParameters() const {}
 
+        // Describe the quantity published as the monitored residual.
+        virtual MonitoredResidualKind getMonitoredResidualKind() const
+        { return MONITORED_RESIDUAL_EXPLICIT; }
+
         // Sets the solver name
         inline void setName(std::string &solver_name ) { m_solver_name = solver_name; }
 
@@ -204,6 +217,8 @@ class Solver : public AuxData
         // Print a norm.
         void print_norm( std::stringstream &ss ) const;
         void print_norm2( std::stringstream &ss ) const;
+        std::string monitored_residual_description() const;
+        std::string convergence_description() const;
 
         // Reference counter.
         int m_ref_count;
@@ -259,8 +274,12 @@ class Solver : public AuxData
         cudaEvent_t m_solve_start, m_solve_stop;
         cudaEvent_t m_iter_start,  m_iter_stop;
 
-        // Timings.
+        // Timings. m_setup_time retains the most recent real setup duration,
+        // while m_setup_time_for_solve is charged only to the first solve that
+        // follows that setup.
         float m_setup_time, m_solve_time;
+        float m_setup_time_for_solve;
+        bool m_setup_time_pending;
 
         bool m_skip_glued_setup;
 

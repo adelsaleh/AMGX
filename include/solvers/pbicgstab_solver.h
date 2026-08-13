@@ -52,6 +52,9 @@ class PBiCGStab_Solver : public Solver<T_Config>
 
         bool getInsertDiagonalDesired() const { if (m_preconditioner != NULL) return m_preconditioner->getInsertDiagonalDesired(); return false; }
 
+        MonitoredResidualKind getMonitoredResidualKind() const
+        { return MONITORED_RESIDUAL_RECURSIVE_VERIFIED; }
+
         // Initialize the solver before running the iterations.
         void solve_init( VVector &b, VVector &x, bool xIsZero );
 

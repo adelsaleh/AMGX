@@ -389,6 +389,12 @@ inline void registerParameters()
     //[F]GMRES
     AMG_Config::registerParameter<int>("gmres_n_restart", "the number of Krylov vectors used in FGMRES or GMRES solver ", 20);
     AMG_Config::registerParameter<int>("gmres_krylov_dim", "maximum size fo the krylov subspace. Can be smaller than restart, in that case the algorithm minimizes the quasi residual (QGMRES). Set to zero to automatically match the restart <0>", 0);
+    AMG_Config::registerParameter<int>("gmres_reliable_residual", "verify estimated GMRES convergence with an explicit residual and restart when needed <0|1>", 0, bool_flag_values);
+    std::vector<std::string> gmres_reorthogonalization_values;
+    gmres_reorthogonalization_values.push_back("NONE");
+    gmres_reorthogonalization_values.push_back("DGKS");
+    gmres_reorthogonalization_values.push_back("ALWAYS");
+    AMG_Config::registerParameter<std::string>("gmres_reorthogonalization", "GMRES modified Gram-Schmidt reorthogonalization mode <NONE|DGKS|ALWAYS>", "NONE", gmres_reorthogonalization_values);
     //IDR
     AMG_Config::registerParameter<int>("subspace_dim_s", "the number of dimensions of the small system ", 8);
     //DENSE_LU_SOLVER

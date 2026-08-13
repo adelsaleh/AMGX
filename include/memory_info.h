@@ -9,40 +9,12 @@ namespace amgx
 class MemoryInfo
 {
     public:
-        static float getTotalMemory()
-        {
-            size_t free;
-            size_t total;
-            cudaMemGetInfo(&free, &total);
-            return total / 1024.0 / 1024 / 1024;
-        }
-
-        static size_t getFreeMemory()
-        {
-            size_t free;
-            size_t total;
-            cudaMemGetInfo(&free, &total);
-            return free / 1024.0 / 1024 / 1024;
-        }
-
-        static float getMaxMemoryUsage()
-        {
-            return max_allocated / 1024.0 / 1024 / 1024;
-        }
-
-        static void updateMaxMemoryUsage()
-        {
-            size_t free;
-            size_t total;
-            cudaMemGetInfo(&free, &total);
-            size_t allocated = total - free;
-
-            if (allocated > max_allocated)
-            {
-                max_allocated = allocated;
-            }
-        }
-    private:
-        static size_t max_allocated;
+        static float getTotalMemory();
+        static size_t getFreeMemory();
+        static float getMemoryUsage();
+        static float getReservedMemoryUsage();
+        static float getMaxMemoryUsage();
+        static float getMaxReservedMemoryUsage();
+        static void updateMaxMemoryUsage();
 };
 }

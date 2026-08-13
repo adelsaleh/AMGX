@@ -31,6 +31,14 @@ namespace memory
 // Implementation class.
 class MemoryManager;
 
+struct DeviceMemoryStats
+{
+    size_t live_bytes;
+    size_t reserved_bytes;
+    size_t peak_live_bytes;
+    size_t peak_reserved_bytes;
+};
+
 // The base class for memory pools.
 class MemoryPool
 {
@@ -76,8 +84,11 @@ class MemoryPool
         bool is_allocated(void *ptr) ;
         // The amount of free memory.
         inline size_t get_free_mem() const { return m_free_mem; }
-        // The amount of used memory.
+        // Legacy diagnostic accessors; prefer get_memory_stats for reporting.
         inline size_t get_used_mem() const { return m_size - m_free_mem; }
+        inline size_t get_reserved_mem() const { return m_reserved_mem; }
+        // Snapshot current suballocations and CUDA memory retained by this pool.
+        void get_memory_stats(size_t &used_bytes, size_t &reserved_bytes) const;
         // Size of the max block.
         inline size_t get_max_block_size() const { return m_max_block_size; }
 
@@ -107,7 +118,7 @@ class MemoryPool
         std::vector<MemoryBlock> m_owned_ptrs;
 
         // Memory alignment enforced by the pool.
-        size_t m_size, m_max_size, m_max_block_size, m_page_size;
+        size_t m_size, m_reserved_mem, m_max_size, m_max_block_size, m_page_size;
         // Have we recently ran a merge.
         bool m_recently_merged;
         // Statistics.
@@ -116,7 +127,7 @@ class MemoryPool
         MemoryBlockList m_used_blocks;
         MemoryBlockList m_free_blocks;
         //Mutex added to fix ICE threadsafe issue
-        std::mutex m_mutex2;
+        mutable std::mutex m_mutex2;
 
     private:
         // No copy.
@@ -173,6 +184,11 @@ void destroyAllPinnedMemoryPools();
 void destroyAllDeviceMemoryPools();
 
 void printInfo();
+
+// Process-wide device memory tracked by AMGX's allocator. These counters do
+// not include allocations made by clients (for example CuPy) in the same CUDA
+// context.
+DeviceMemoryStats getDeviceMemoryStats();
 
 // adds pre-allocated block to the device pool
 void expandDeviceMemoryPool(size_t size, size_t max_block_size);

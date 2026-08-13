@@ -11,10 +11,13 @@
 #include <thrust/device_free.h>
 #include <thrust/device_vector.h>
 #include <limits>
+#include <new>
+#include <sstream>
 #include <stdexcept>
 #include <amgx_config.h>
 
 #include <global_thread_handle.h>
+#include <error.h>
 
 // Memory allocator based on the thrust default memory allocator but uses AMGX bits
 
@@ -100,8 +103,21 @@ class thrust_amgx_allocator<T, AMGX_device>
         inline pointer allocate(size_type cnt,
                                 const_pointer = const_pointer(static_cast<T *>(0)))
         {
-            void *ptr;
-            amgx::memory::cudaMallocAsync(&ptr, sizeof(T)*cnt);
+            void *ptr = NULL;
+            const cudaError_t status = amgx::memory::cudaMallocAsync(&ptr, sizeof(T)*cnt);
+
+            if (status == cudaErrorMemoryAllocation)
+            {
+                throw std::bad_alloc();
+            }
+
+            if (status != cudaSuccess)
+            {
+                std::stringstream error;
+                error << "Cuda failure: '" << cudaGetErrorString(status) << "'";
+                FatalError(error.str(), AMGX_ERR_CUDA_FAILURE);
+            }
+
             return pointer((T *)ptr);
         } // end allocate()
 

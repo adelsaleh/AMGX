@@ -37,6 +37,8 @@ Solver<TConfig>::Solver(AMG_Config &cfg, const std::string &cfg_scope,
     m_store_res_history = cfg.getParameter<int>("store_res_history", cfg_scope) != 0;
     m_obtain_timings = cfg.getParameter<int>("obtain_timings", cfg_scope) != 0;
     m_scaling = cfg.getParameter<std::string>("scaling", cfg_scope);
+    m_setup_time_for_solve = 0.0f;
+    m_setup_time_pending = false;
 
     if ( m_scaling.compare("NONE") != 0 ) //create scaler object
     {
@@ -152,6 +154,8 @@ template<class TConfig>
 void Solver<TConfig>::reset_setup_timer()
 {
     m_setup_time = 0.0f;
+    m_setup_time_for_solve = 0.0f;
+    m_setup_time_pending = false;
 }
 
 template<class TConfig>
@@ -178,6 +182,80 @@ void Solver<TConfig>::print_norm2(std::stringstream &ss) const
     {
         ss << std::scientific << std::setprecision(4) << m_nrm[i] << " ";
     }
+}
+
+template<class TConfig>
+std::string Solver<TConfig>::monitored_residual_description() const
+{
+    std::stringstream ss;
+
+    switch (getMonitoredResidualKind())
+    {
+        case MONITORED_RESIDUAL_EXPLICIT:
+            ss << "explicit b-A*x";
+            break;
+
+        case MONITORED_RESIDUAL_RECURSIVE:
+            ss << "recursive residual (algebraically b-A*x)";
+            break;
+
+        case MONITORED_RESIDUAL_ARNOLDI_ESTIMATE:
+            ss << "Arnoldi estimate of ||b-A*x||";
+            break;
+
+        case MONITORED_RESIDUAL_RECURSIVE_VERIFIED:
+            ss << "recursive residual; explicit b-A*x on early-exit verification";
+            break;
+
+        case MONITORED_RESIDUAL_ARNOLDI_VERIFIED:
+            ss << "Arnoldi estimate; explicit b-A*x on verification rows";
+            break;
+    }
+
+    ss << "; norm=" << getString(m_norm_type);
+    ss << (m_use_scalar_norm || m_A->get_block_dimy() == 1 ? " (scalar)" : " (per block component)");
+    ss << "; unpreconditioned; system=";
+
+    if (m_scaling == "NONE")
+    {
+        ss << "as supplied";
+    }
+    else
+    {
+        ss << "AMGX-scaled (" << m_scaling << ")";
+    }
+
+    return ss.str();
+}
+
+template<class TConfig>
+std::string Solver<TConfig>::convergence_description() const
+{
+    const std::string name = m_convergence->getName();
+    const double tolerance = m_cfg->template getParameter<double>("tolerance", m_cfg_scope);
+    std::stringstream ss;
+    ss << name << "; ";
+
+    if (name == "ABSOLUTE")
+        ss << "residual < ";
+    else if (name == "RELATIVE_INI" || name == "RELATIVE_INI_CORE")
+        ss << "residual/initial <= ";
+    else if (name == "RELATIVE_MAX" || name == "RELATIVE_MAX_CORE")
+        ss << "residual/max-seen <= ";
+    else if (name == "COMBINED_REL_INI_ABS")
+    {
+        const double relative_tolerance = m_cfg->template getParameter<double>("alt_rel_tolerance", m_cfg_scope);
+        ss << std::scientific << std::setprecision(3)
+           << "residual < " << tolerance << " or residual/initial <= " << relative_tolerance
+           << " (or precision floor)";
+        return ss.str();
+    }
+    else
+        ss << "tolerance=";
+
+    ss << std::scientific << std::setprecision(3) << tolerance;
+    if (name != "ABSOLUTE") ss << " (or precision floor)";
+    return ss.str();
 }
 
 // Method to compute residual
@@ -519,6 +597,7 @@ void Solver<TConfig>::setup( Operator<TConfig> &A, bool reuse_matrix_structure)
         cudaCheckError();
         cudaEventElapsedTime(&m_setup_time, m_setup_start, m_setup_stop);
         m_setup_time *= 1e-3f;
+        m_setup_time_pending = true;
 #ifdef AMGX_WITH_MPI
 #ifdef MPI_SOLVE_PROFILE
 
@@ -644,6 +723,12 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
 
     if (m_obtain_timings)
     {
+        // A setup belongs to at most one solve timing cycle. Keep
+        // m_setup_time itself intact so reused solvers can still report the
+        // duration of the cached hierarchy without charging it repeatedly.
+        m_setup_time_for_solve = m_setup_time_pending ? m_setup_time : 0.0f;
+        m_setup_time_pending = false;
+
 #ifdef AMGX_WITH_MPI
 #ifdef MPI_SOLVE_PROFILE
 
@@ -721,38 +806,52 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
         m_res_history[0] = m_nrm;
     }
 
+    float solve_peak_used_gib = 0.0f;
+    float solve_peak_held_gib = 0.0f;
+
     // Print solve informations if needed.
     if (m_verbosity_level > 2 && getPrintSolveStats())
     {
         std::stringstream ss;
-        ss << std::setw(15) << "iter" << std::setw(20) << " Mem Usage (GB)"
-           << std::setw(15) << "residual";
+        solve_peak_used_gib = MemoryInfo::getMemoryUsage();
+        solve_peak_held_gib = MemoryInfo::getReservedMemoryUsage();
+        const int table_width = 28 + 45 * static_cast<int>(m_nrm.size());
+        ss << "  monitored residual: " << monitored_residual_description() << std::endl;
+        ss << "  stop criterion: " << convergence_description() << std::endl;
+        ss << std::setw(8) << "iter"
+           << std::setw(10) << "used"
+           << std::setw(10) << "held";
 
-        for (int i = 0; i < m_nrm.size() - 1; i++)
+        for (int i = 0; i < m_nrm.size(); i++)
         {
-            ss << std::setw(15) << " ";
-        }
-
-        ss << std::setw(15) << "rate";
-
-        for (int i = 0; i < m_nrm.size() - 1; i++)
-        {
-            ss << std::setw(15) << " ";
-        }
-
-        ss << std::endl;
-        ss
-                << "         ----------------------------------------------------------------------";
-
-        for (int i = 0; i < m_nrm.size() - 1; i++)
-        {
-            ss << "-----------------------";    // 15 + 8
+            const std::string suffix = m_nrm.size() == 1 ? "" : "[" + std::to_string(i) + "]";
+            ss << std::setw(15) << ("residual" + suffix)
+               << std::setw(15) << ("res/initial" + suffix)
+               << std::setw(15) << ("res/previous" + suffix);
         }
 
         ss << std::endl;
-        ss << std::setw(15) << "Ini";
-        ss << std::setw(20) << MemoryInfo::getMaxMemoryUsage();
-        print_norm(ss);
+        ss << std::setw(8) << ""
+           << std::setw(10) << "GiB"
+           << std::setw(10) << "GiB";
+        ss << std::endl;
+        ss << "  " << std::string(table_width, '-');
+        ss << std::endl;
+        ss << std::setw(8) << "Ini"
+           << std::fixed << std::setprecision(3)
+           << std::setw(10) << solve_peak_used_gib
+           << std::setw(10) << solve_peak_held_gib;
+
+        for (int i = 0; i < m_nrm.size(); i++)
+        {
+            ss << std::scientific << std::setprecision(6) << std::setw(15) << m_nrm[i];
+            if (m_nrm_ini[i] > types::util<PODValueB>::get_zero())
+                ss << std::scientific << std::setprecision(3) << std::setw(15) << PODValueB(1);
+            else
+                ss << std::setw(15) << "-";
+            ss << std::setw(15) << "-";
+        }
+
         ss << std::endl;
         amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
     }
@@ -812,15 +911,32 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
         // If we print stats... Let's do it.
         if (m_verbosity_level > 2 && getPrintSolveStats())
         {
+            const float used_gib = MemoryInfo::getMemoryUsage();
+            const float held_gib = MemoryInfo::getReservedMemoryUsage();
+            solve_peak_used_gib = std::max(solve_peak_used_gib, used_gib);
+            solve_peak_held_gib = std::max(solve_peak_held_gib, held_gib);
             ss.str(std::string());
-            ss << std::setw(15) << m_curr_iter;
-            ss << std::setw(20) << MemoryInfo::getMaxMemoryUsage();
-            print_norm(ss);
-            ss << std::setw(15);
+            ss.clear();
+            ss << std::setw(8) << m_curr_iter
+               << std::fixed << std::setprecision(3)
+               << std::setw(10) << used_gib
+               << std::setw(10) << held_gib;
 
             for (int i = 0; i < last_nrm.size(); i++)
-                ss << std::fixed << std::setprecision(4) << m_nrm[i] / last_nrm[i]
-                   << std::setw(8);
+            {
+                ss << std::scientific << std::setprecision(6) << std::setw(15) << m_nrm[i];
+                if (m_nrm_ini[i] > types::util<PODValueB>::get_zero())
+                    ss << std::scientific << std::setprecision(3) << std::setw(15)
+                       << m_nrm[i] / m_nrm_ini[i];
+                else
+                    ss << std::setw(15) << "-";
+
+                if (last_nrm[i] > types::util<PODValueB>::get_zero())
+                    ss << std::scientific << std::setprecision(3) << std::setw(15)
+                       << m_nrm[i] / last_nrm[i];
+                else
+                    ss << std::setw(15) << "-";
+            }
 
             ss << std::endl;
             amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
@@ -893,50 +1009,53 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
     if (m_verbosity_level > 2 && getPrintSolveStats())
     {
         ss.str(std::string());
-        ss
-                << "         ----------------------------------------------------------------------";
-
-        for (int i = 0; i < m_nrm.size() - 1; i++)
-        {
-            ss << "-----------------------";
-        }
-
+        ss.clear();
+        const int table_width = 28 + 45 * static_cast<int>(m_nrm.size());
+        ss << "  " << std::string(table_width, '-');
         ss << std::endl;
         ss << "         Total Iterations: " << m_num_iters << std::endl;
-        ss << "         Avg Convergence Rate: \t\t";
-
-        for (int i = 0; i < last_nrm.size(); i++)
-            ss << std::fixed << std::setw(15)
-               << ((m_nrm_ini[i] > eps) ? pow(last_nrm[i] / m_nrm_ini[i],  types::util<PODValueB>::get_one() / m_num_iters) : m_nrm_ini[i]);
-
-        ss << std::endl;
-        ss << "         Final Residual: \t\t" << std::setprecision(6);
+        ss << "         Geometric mean res/previous:";
 
         for (int i = 0; i < last_nrm.size(); i++)
         {
-            ss << std::scientific << std::setw(15) << last_nrm[i] << std::fixed;
+            if (m_num_iters > 0 && m_nrm_ini[i] > eps)
+                ss << std::scientific << std::setprecision(4) << std::setw(15)
+                   << pow(last_nrm[i] / m_nrm_ini[i], types::util<PODValueB>::get_one() / m_num_iters);
+            else
+                ss << std::setw(15) << "-";
         }
 
         ss << std::endl;
-        ss << "         Total Reduction in Residual: \t" << std::setprecision(6);
+        ss << "         Final monitored residual:";
 
         for (int i = 0; i < last_nrm.size(); i++)
-            ss << std::scientific << std::setw(15)
-               << ((m_nrm_ini[i] > eps) ? last_nrm[i] / m_nrm_ini[i] : m_nrm_ini[i])
-               << std::fixed;
-
-        ss << std::endl;
-        ss << "         Maximum Memory Usage: \t\t" << std::setprecision(3)
-           << std::setw(15) << MemoryInfo::getMaxMemoryUsage() << " GB"
-           << std::endl;
-        ss
-                << "         ----------------------------------------------------------------------";
-
-        for (int i = 0; i < m_nrm.size() - 1; i++)
         {
-            ss << "-----------------------";
+            ss << std::scientific << std::setprecision(6) << std::setw(15) << last_nrm[i];
         }
 
+        ss << std::endl;
+        ss << "         Final residual/initial:    ";
+
+        for (int i = 0; i < last_nrm.size(); i++)
+        {
+            if (m_nrm_ini[i] > eps)
+                ss << std::scientific << std::setprecision(6) << std::setw(15)
+                   << last_nrm[i] / m_nrm_ini[i];
+            else
+                ss << std::setw(15) << "-";
+        }
+
+        ss << std::endl;
+        const float current_used_gib = MemoryInfo::getMemoryUsage();
+        const float current_held_gib = MemoryInfo::getReservedMemoryUsage();
+        solve_peak_used_gib = std::max(solve_peak_used_gib, current_used_gib);
+        solve_peak_held_gib = std::max(solve_peak_held_gib, current_held_gib);
+        ss << "         AMGX memory (process, GiB): current used="
+           << std::fixed << std::setprecision(3) << current_used_gib
+           << " held=" << current_held_gib
+           << "; sampled solve peak used=" << solve_peak_used_gib
+           << " held=" << solve_peak_held_gib << std::endl;
+        ss << "  " << std::string(table_width, '-');
         ss << std::endl;
         amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
         ss.str(std::string());
@@ -1023,8 +1142,14 @@ template<class TConfig>
 void Solver<TConfig>::print_timings()
 {
     std::stringstream ss;
-    ss << "Total Time: " << m_setup_time + m_solve_time << std::endl;
-    ss << "    setup: " << m_setup_time << " s\n";
+    ss << "Total Time: " << m_setup_time_for_solve + m_solve_time << std::endl;
+    ss << "    setup: " << m_setup_time_for_solve << " s\n";
+
+    if (m_setup_time_for_solve == 0.0f && m_setup_time > 0.0f)
+    {
+        ss << "    cached setup (last, not included): " << m_setup_time << " s\n";
+    }
+
     ss << "    solve: " << m_solve_time << " s\n";
     ss << "    solve(per iteration): " << ((m_num_iters == 0) ? m_num_iters : m_solve_time / m_num_iters) << " s\n";
     amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
@@ -1155,4 +1280,3 @@ AMGX_FORCOMPLEX_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
 
 }// namespace amgx
-

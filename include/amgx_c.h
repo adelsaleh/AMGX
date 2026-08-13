@@ -175,6 +175,12 @@ void AMGX_API AMGX_abort
  int err);
 
 /* System */
+AMGX_RC AMGX_API AMGX_get_device_memory_stats
+(size_t *live_bytes,
+ size_t *reserved_bytes,
+ size_t *peak_live_bytes,
+ size_t *peak_reserved_bytes);
+
 AMGX_RC AMGX_API AMGX_pin_memory
 (void *ptr,
  unsigned int bytes);

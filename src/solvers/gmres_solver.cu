@@ -22,7 +22,8 @@ namespace amgx
 
 template< class T_Config>
 GMRES_Solver<T_Config>::GMRES_Solver( AMG_Config &cfg, const std::string &cfg_scope ) :
-    Solver<T_Config>( cfg, cfg_scope ), m_preconditioner(0), no_preconditioner(true)
+    Solver<T_Config>( cfg, cfg_scope ), m_cycle_iteration(0), m_reliable_residual(false),
+    m_reorthogonalization(REORTHOGONALIZE_NONE), m_preconditioner(0), no_preconditioner(true)
 
 {
     std::string solverName, new_scope, tmp_scope;
@@ -41,6 +42,17 @@ GMRES_Solver<T_Config>::GMRES_Solver( AMG_Config &cfg, const std::string &cfg_sc
 
     m_R = cfg.AMG_Config::template getParameter<int>("gmres_n_restart", cfg_scope);
     m_krylov_size = std::min( this->m_max_iters, m_R );
+    m_reliable_residual = cfg.AMG_Config::template getParameter<int>("gmres_reliable_residual", cfg_scope) != 0;
+    const std::string reorthogonalization = cfg.AMG_Config::template getParameter<std::string>("gmres_reorthogonalization", cfg_scope);
+
+    if (reorthogonalization == "DGKS")
+    {
+        m_reorthogonalization = REORTHOGONALIZE_DGKS;
+    }
+    else if (reorthogonalization == "ALWAYS")
+    {
+        m_reorthogonalization = REORTHOGONALIZE_ALWAYS;
+    }
 
     if ( this->m_norm_type != L2 )
     {
@@ -65,6 +77,20 @@ void
 GMRES_Solver<T_Config>::printSolverParameters() const
 {
     std::cout << "gmres_n_restart=" << this->m_R << std::endl;
+    std::cout << "gmres_reliable_residual=" << this->m_reliable_residual << std::endl;
+
+    if (m_reorthogonalization == REORTHOGONALIZE_DGKS)
+    {
+        std::cout << "gmres_reorthogonalization=DGKS" << std::endl;
+    }
+    else if (m_reorthogonalization == REORTHOGONALIZE_ALWAYS)
+    {
+        std::cout << "gmres_reorthogonalization=ALWAYS" << std::endl;
+    }
+    else
+    {
+        std::cout << "gmres_reorthogonalization=NONE" << std::endl;
+    }
 
     if (!no_preconditioner)
     {
@@ -212,7 +238,9 @@ static __host__ void PlaneRotation( cusp::array2d<ValueType, cusp::host_memory, 
 template<class T_Config>
 void
 GMRES_Solver<T_Config>::solve_init( VVector &b, VVector &x, bool xIsZero )
-{}
+{
+    m_cycle_iteration = 0;
+}
 
 template<class T_Config>
 AMGX_STATUS
@@ -262,8 +290,10 @@ GMRES_Solver<T_Config>::solve_one_iteration( VVector &b, VVector &x )
     m_s[0] = m_s[0] / m_H(0, 0);
     //  Update the solution
     axpy( m_Z_vector, x, m_s[0], offset, size );
+    AMGX_STATUS conv_stat = this->m_monitor_convergence && m_reliable_residual ? this->converged(b, x) :
+                            (this->m_monitor_convergence ? this->converged() : AMGX_ST_CONVERGED);
     this->m_A->setView(oldView);
-    return this->m_monitor_convergence ? this->converged() : AMGX_ST_CONVERGED;
+    return conv_stat;
 }
 
 template<class T_Config>
@@ -283,7 +313,7 @@ GMRES_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
 
     AMGX_STATUS conv_stat = AMGX_ST_NOT_CONVERGED;
 
-    int i = this->m_curr_iter % m_R; //current iteration within restart
+    int i = m_reliable_residual ? m_cycle_iteration : this->m_curr_iter % m_R; //current iteration within restart
 
     if (i == 0)
     {
@@ -298,6 +328,7 @@ GMRES_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
 
             if ( isDone( ( conv_stat = this->converged() ) ) )
             {
+                this->m_A->setView(oldView);
                 return conv_stat;
             }
         }
@@ -322,6 +353,10 @@ GMRES_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
     }
 
     A.apply(m_Z_vector, m_V_vectors[i + 1]);
+    const bool need_pre_orthogonalization_norm = m_reliable_residual ||
+                                                  m_reorthogonalization != REORTHOGONALIZE_NONE;
+    const PodTypeB pre_orthogonalization_norm = need_pre_orthogonalization_norm ?
+                                                get_norm(A, m_V_vectors[i + 1], L2) : PodTypeB(0.0);
 
     // Modified Gram-Schmidt
     for ( int k = 0; k <= i; ++k )
@@ -332,20 +367,57 @@ GMRES_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
         axpy( m_V_vectors[k], m_V_vectors[i + 1], types::util<ValueTypeB>::invert(m_H(k, i)), offset, size );
     }
 
-    m_H(i + 1, i) = types::util<ValueTypeB>::get_one() * get_norm(A, m_V_vectors[i + 1], L2);
-    scal( m_V_vectors[i + 1], types::util<ValueTypeB>::get_one() / m_H(i + 1, i), offset, size );
+    PodTypeB post_orthogonalization_norm = get_norm(A, m_V_vectors[i + 1], L2);
+    const bool reorthogonalize = m_reorthogonalization == REORTHOGONALIZE_ALWAYS ||
+                                 (m_reorthogonalization == REORTHOGONALIZE_DGKS &&
+                                  post_orthogonalization_norm < PodTypeB(0.717) * pre_orthogonalization_norm);
+
+    if (reorthogonalize)
+    {
+        for (int k = 0; k <= i; ++k)
+        {
+            const ValueTypeB correction = dot(A, m_V_vectors[i + 1], m_V_vectors[k]);
+            m_H(k, i) = m_H(k, i) + correction;
+            axpy(m_V_vectors[k], m_V_vectors[i + 1], types::util<ValueTypeB>::invert(correction), offset, size);
+        }
+
+        post_orthogonalization_norm = get_norm(A, m_V_vectors[i + 1], L2);
+    }
+
+    m_H(i + 1, i) = types::util<ValueTypeB>::get_one() * post_orthogonalization_norm;
+    const PodTypeB breakdown_tolerance = sizeof(PodTypeB) == 4 ? PodTypeB(1.0e-6) : PodTypeB(1.0e-12);
+    const bool happy_breakdown = need_pre_orthogonalization_norm ?
+                                 (pre_orthogonalization_norm == PodTypeB(0.0) ||
+                                  post_orthogonalization_norm <= breakdown_tolerance * pre_orthogonalization_norm) :
+                                 post_orthogonalization_norm == PodTypeB(0.0);
+
+    if (!happy_breakdown)
+    {
+        scal( m_V_vectors[i + 1], types::util<ValueTypeB>::get_one() / m_H(i + 1, i), offset, size );
+    }
+
     PlaneRotation( m_H, m_cs, m_sn, m_s, i );
 
-    // Check for convergence
-    // abs(s[i+1]) = L2 norm of residual
+    // Check the inexpensive Arnoldi residual estimate.
+    // abs(s[i+1]) = estimated L2 norm of residual.
     if ( Base::m_monitor_convergence )
     {
         this->m_nrm[0] = types::util<ValueTypeB>::abs( m_s[i + 1] );
         conv_stat = this->converged();
+
+        if (isDiverged(conv_stat))
+        {
+            this->m_A->setView(oldView);
+            return conv_stat;
+        }
     }
 
-    // If reached restart limit or last iteration or if converged, compute x vector
-    if ( i == (m_R - 1) || this->is_last_iter() || isDone(conv_stat) )
+    // Reliable mode treats estimated convergence as a request to form a
+    // candidate solution and verify b-A*x.  If verification fails, the next
+    // iteration begins a fresh cycle from that explicit residual.
+    const bool update_solution = i == (m_R - 1) || this->is_last_iter() || happy_breakdown || isDone(conv_stat);
+
+    if (update_solution)
     {
         // Solve upper triangular system in place
         for (int j = i; j >= 0; j--)
@@ -385,6 +457,20 @@ GMRES_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
         // Update the solution
         // Add to x0
         axpy( m_V_vectors[0], x, types::util<ValueTypeB>::get_one(), offset, size );
+
+        if (Base::m_monitor_convergence && m_reliable_residual)
+        {
+            conv_stat = this->converged(b, x);
+        }
+
+        if (m_reliable_residual && !isDone(conv_stat) && !this->is_last_iter())
+        {
+            m_cycle_iteration = 0;
+        }
+    }
+    else if (m_reliable_residual)
+    {
+        m_cycle_iteration = i + 1;
     }
 
     this->m_A->setView(oldView);

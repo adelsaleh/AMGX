@@ -78,6 +78,13 @@ class FGMRES_Solver : public Solver<T_Config>
             return false;
         }
 
+        MonitoredResidualKind getMonitoredResidualKind() const
+        {
+            return use_scalar_L2_norm && !update_r_every_iteration
+                       ? MONITORED_RESIDUAL_ARNOLDI_ESTIMATE
+                       : MONITORED_RESIDUAL_RECURSIVE;
+        }
+
         void solve_init( VVector &b, VVector &x, bool xIsZero );
         // Run a single iteration. Compute the residual and its norm and decide convergence.
         bool solve_one_iteration( VVector &b, VVector &x );

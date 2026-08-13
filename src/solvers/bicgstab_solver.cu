@@ -148,7 +148,7 @@ BiCGStab_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero
 
     // Do we converge ?
     if ( this->m_monitor_convergence &&
-         isDone( (conv_stat = this->compute_norm_and_converged( m_s, m_s_norm )) ) )
+         isDone( (conv_stat = this->compute_norm_and_converged( *this->m_r, this->m_nrm )) ) )
     {
         return conv_stat;
     }

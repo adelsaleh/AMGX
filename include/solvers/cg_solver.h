@@ -35,6 +35,9 @@ class CG_Solver : public Solver<T_Config>
 
         bool getInsertDiagonalDesired() const { return false; }
 
+        MonitoredResidualKind getMonitoredResidualKind() const
+        { return MONITORED_RESIDUAL_RECURSIVE; }
+
         // Destructor
         ~CG_Solver();
 

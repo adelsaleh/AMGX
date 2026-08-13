@@ -27,8 +27,18 @@ class GMRES_Solver : public Solver<T_Config>
 
     private:
 
+        enum ReorthogonalizationMode
+        {
+            REORTHOGONALIZE_NONE,
+            REORTHOGONALIZE_DGKS,
+            REORTHOGONALIZE_ALWAYS
+        };
+
         int m_R;  //Iterations between restarts
         int m_krylov_size;
+        int m_cycle_iteration;
+        bool m_reliable_residual;
+        ReorthogonalizationMode m_reorthogonalization;
         ValueTypeA res_pre;
         bool no_preconditioner;
         // Preconditioner
@@ -65,6 +75,12 @@ class GMRES_Solver : public Solver<T_Config>
         bool getReorderColsByColorDesired() const { if (m_preconditioner != NULL) return m_preconditioner->getReorderColsByColorDesired(); return false; }
 
         bool getInsertDiagonalDesired() const { if (m_preconditioner != NULL) return m_preconditioner->getInsertDiagonalDesired(); return false; }
+
+        MonitoredResidualKind getMonitoredResidualKind() const
+        {
+            return m_reliable_residual ? MONITORED_RESIDUAL_ARNOLDI_VERIFIED
+                                       : MONITORED_RESIDUAL_ARNOLDI_ESTIMATE;
+        }
 
         // Initialize the solver before running the iterations.
         void solve_init( VVector &b, VVector &x, bool xIsZero );

@@ -50,6 +50,7 @@ namespace memory
 
 MemoryPool::MemoryPool(size_t max_block_size, size_t page_size, size_t max_size)
     : m_size(0)
+    , m_reserved_mem(0)
     , m_max_size(max_size)
     , m_max_block_size(max_block_size)
     , m_page_size(page_size)
@@ -110,6 +111,7 @@ void MemoryPool::add_memory(void *ptr, size_t size, bool managed)
 #endif
     m_free_blocks.push_back(MemoryBlock(aligned_ptr, free_size, true, managed));
     m_size += free_size;
+    m_reserved_mem += size;
     m_free_mem += free_size;
     m_mutex2.unlock();
 }
@@ -308,21 +310,53 @@ void MemoryPool::free(void *ptr, size_t &freed_size)
     m_mutex2.unlock();
 }
 
+void MemoryPool::get_memory_stats(size_t &used_bytes, size_t &reserved_bytes) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex2);
+    used_bytes = 0;
+    reserved_bytes = 0;
+
+    for (MemoryBlockListConstIterator it = m_used_blocks.begin(); it != m_used_blocks.end(); ++it)
+    {
+        used_bytes += it->m_size;
+    }
+
+    // m_reserved_mem is reset when a thread pool is synchronized into the
+    // main pool, while the thread pool still owns the underlying CUDA blocks.
+    // The ownership list is therefore the authoritative retained-byte count.
+    for (std::vector<MemoryBlock>::const_iterator it = m_owned_ptrs.begin(); it != m_owned_ptrs.end(); ++it)
+    {
+        reserved_bytes += it->m_size;
+    }
+}
+
 void MemoryPool::free_all()
 {
-    m_mutex2.lock();
+    std::lock_guard<std::mutex> lock(m_mutex2);
     m_used_blocks.clear();
     m_free_blocks.clear();
-    std::vector<MemoryBlock> owned_ptrs = m_owned_ptrs;
-    m_owned_ptrs.clear();
+    m_size = 0;
+    m_reserved_mem = 0;
+    m_free_mem = 0;
 
-    for ( size_t i = 0 ; i < owned_ptrs.size() ; ++i )
+    for ( size_t i = 0 ; i < m_owned_ptrs.size() ; ++i )
     {
-        add_memory(owned_ptrs[i].m_begin, owned_ptrs[i].m_size, owned_ptrs[i].m_managed);
+        char *aligned_ptr = static_cast<char *>(m_owned_ptrs[i].m_begin);
+        if (reinterpret_cast<size_t>(aligned_ptr) % m_page_size)
+        {
+            aligned_ptr = reinterpret_cast<char *>(
+                ((reinterpret_cast<size_t>(aligned_ptr) + m_page_size - 1) / m_page_size) * m_page_size);
+        }
+
+        const size_t free_size = m_owned_ptrs[i].m_size
+                               - (aligned_ptr - static_cast<char *>(m_owned_ptrs[i].m_begin));
+        m_free_blocks.push_back(MemoryBlock(
+            aligned_ptr, free_size, true, m_owned_ptrs[i].m_managed));
+        m_size += free_size;
+        m_reserved_mem += m_owned_ptrs[i].m_size;
     }
 
     m_free_mem = m_size;
-    m_mutex2.unlock();
 }
 
 bool MemoryPool::is_allocated(void *ptr)
@@ -443,6 +477,10 @@ struct MemoryManager
         , m_use_device_pool(false)
         , m_alloc_scaling_factor(0)
         , m_alloc_scaling_threshold(16 * 1024 * 1024)
+        , m_device_live_bytes(0)
+        , m_device_reserved_bytes(0)
+        , m_device_peak_live_bytes(0)
+        , m_device_peak_reserved_bytes(0)
 #ifdef USE_CUDAMALLOCASYNC
         , m_use_cudamallocasync(false)
 #endif
@@ -496,6 +534,32 @@ struct MemoryManager
         return m_use_cudamallocasync;
     }
 
+    void add_device_live_bytes(size_t bytes)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_device_live_bytes += bytes;
+    }
+
+    void remove_device_live_bytes(size_t bytes)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        assert(bytes <= m_device_live_bytes);
+        m_device_live_bytes = bytes <= m_device_live_bytes ? m_device_live_bytes - bytes : 0;
+    }
+
+    void add_device_reserved_bytes(size_t bytes)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_device_reserved_bytes += bytes;
+    }
+
+    void remove_device_reserved_bytes(size_t bytes)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        assert(bytes <= m_device_reserved_bytes);
+        m_device_reserved_bytes = bytes <= m_device_reserved_bytes ? m_device_reserved_bytes - bytes : 0;
+    }
+
     // Mutex to make functions thread-safe.
     std::recursive_mutex m_mutex;
 
@@ -538,6 +602,14 @@ struct MemoryManager
     size_t m_alloc_scaling_factor;
     // Scaling threshold.
     size_t m_alloc_scaling_threshold;
+
+    // Process-wide AMGX device allocation statistics. Pool suballocations
+    // contribute to live bytes; CUDA allocations owned by a pool or used as
+    // fallbacks contribute to reserved bytes.
+    size_t m_device_live_bytes;
+    size_t m_device_reserved_bytes;
+    size_t m_device_peak_live_bytes;
+    size_t m_device_peak_reserved_bytes;
 
     // whether the device pool is a native pool
     bool m_use_cudamallocasync;
@@ -589,7 +661,15 @@ void setDeviceMemoryPool(DeviceMemoryPool *pool)
 {
     MemoryManager &manager = MemoryManager::get_instance();
     manager.m_mutex.lock();
+    if (manager.m_main_device_pool != NULL)
+    {
+        manager.remove_device_reserved_bytes(manager.m_main_device_pool->get_reserved_mem());
+    }
     manager.m_main_device_pool = pool;
+    if (pool != NULL)
+    {
+        manager.add_device_reserved_bytes(pool->get_reserved_mem());
+    }
     manager.m_mutex.unlock();
 }
 
@@ -605,7 +685,16 @@ void setDeviceMemoryPool(_thread_id thread_id, DeviceMemoryPool *pool)
 {
     MemoryManager &manager = MemoryManager::get_instance();
     manager.m_mutex.lock();
+    MemoryManager::DevicePoolMap::iterator existing = manager.m_thread_device_pools.find(thread_id);
+    if (existing != manager.m_thread_device_pools.end() && existing->second != NULL)
+    {
+        manager.remove_device_reserved_bytes(existing->second->get_reserved_mem());
+    }
     manager.m_thread_device_pools[thread_id] = pool;
+    if (pool != NULL)
+    {
+        manager.add_device_reserved_bytes(pool->get_reserved_mem());
+    }
     manager.m_mutex.unlock();
 }
 
@@ -622,6 +711,10 @@ void destroyDeviceMemoryPool()
 {
     MemoryManager &manager = MemoryManager::get_instance();
     manager.m_mutex.lock();
+    if (manager.m_main_device_pool != NULL)
+    {
+        manager.remove_device_reserved_bytes(manager.m_main_device_pool->get_reserved_mem());
+    }
     delete manager.m_main_device_pool;
     manager.m_main_device_pool = NULL;
     manager.m_mutex.unlock();
@@ -654,6 +747,7 @@ void destroyDeviceMemoryPool(_thread_id thread_id)
         FatalError("INTERNAL ERROR: Invalid device memory pool", AMGX_ERR_UNKNOWN);
     }
 
+    manager.remove_device_reserved_bytes(it->second->get_reserved_mem());
     delete it->second;
     manager.m_thread_device_pools.erase(it);
     manager.m_mutex.unlock();
@@ -679,10 +773,10 @@ void destroyAllDeviceMemoryPools()
 {
     MemoryManager &manager = MemoryManager::get_instance();
     manager.m_mutex.lock();
-    MemoryManager::DevicePoolMap::iterator it = manager.m_thread_device_pools.begin();
-
-    for ( ; it != manager.m_thread_device_pools.end() ; ++it )
+    while (!manager.m_thread_device_pools.empty())
     {
+        MemoryManager::DevicePoolMap::iterator it = manager.m_thread_device_pools.begin();
+        manager.remove_device_reserved_bytes(it->second->get_reserved_mem());
         delete it->second;
         manager.m_thread_device_pools.erase(it);
     }
@@ -856,7 +950,17 @@ cudaError_t cudaMallocAsync(void **ptr, size_t size, cudaStream_t stream)
 #ifdef USE_CUDAMALLOCASYNC
     if (manager.uses_cudamallocasync())
     {
-        return ::cudaMallocAsync(ptr, size, stream);
+        cudaError_t status = ::cudaMallocAsync(ptr, size, stream);
+
+        if (status == cudaSuccess)
+        {
+            std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+            manager.m_allocated_blocks[*ptr] = size;
+            manager.add_device_live_bytes(size);
+            manager.add_device_reserved_bytes(size);
+        }
+
+        return status;
     }
 #endif
 
@@ -900,6 +1004,7 @@ cudaError_t cudaMallocAsync(void **ptr, size_t size, cudaStream_t stream)
     if ( new_ptr != NULL )
     {
         *ptr = new_ptr;
+        manager.add_device_live_bytes(allocated_size);
     }
     else
     {
@@ -923,6 +1028,8 @@ cudaError_t cudaMallocAsync(void **ptr, size_t size, cudaStream_t stream)
 
         manager.m_mutex.lock();
         manager.m_allocated_blocks[*ptr] = allocated_size;
+        manager.add_device_live_bytes(allocated_size);
+        manager.add_device_reserved_bytes(allocated_size);
         manager.m_mutex.unlock();
 #ifdef AMGX_PRINT_MEMORY_INFO
 #ifdef MULTIGPU
@@ -974,7 +1081,26 @@ cudaError_t cudaFreeAsync(void *ptr, cudaStream_t stream)
 #ifdef USE_CUDAMALLOCASYNC
     if (manager.uses_cudamallocasync())
     {
-        return ::cudaFreeAsync(ptr, stream);
+        size_t allocated_size = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+            MemoryManager::MemoryBlockMap::iterator it = manager.m_allocated_blocks.find(ptr);
+            if (it != manager.m_allocated_blocks.end())
+            {
+                allocated_size = it->second;
+            }
+        }
+
+        cudaError_t status = ::cudaFreeAsync(ptr, stream);
+        if (status == cudaSuccess && allocated_size != 0)
+        {
+            std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+            manager.m_allocated_blocks.erase(ptr);
+            manager.remove_device_live_bytes(allocated_size);
+            manager.remove_device_reserved_bytes(allocated_size);
+        }
+
+        return status;
     }
 #endif
 
@@ -1017,6 +1143,7 @@ cudaError_t cudaFreeAsync(void *ptr, cudaStream_t stream)
     if ( pool != NULL && pool->is_allocated(ptr) )
     {
         pool->free(ptr, freed_size);
+        manager.remove_device_live_bytes(freed_size);
     }
     else if ( pool != NULL && manager.m_use_async_free )
     {
@@ -1031,25 +1158,53 @@ cudaError_t cudaFreeAsync(void *ptr, cudaStream_t stream)
         }
 
 #endif
-        MemoryManager::MemoryBlockMap::iterator ptr_it = manager.m_allocated_blocks.find(ptr);
+        size_t allocated_size = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+            MemoryManager::MemoryBlockMap::iterator ptr_it = manager.m_allocated_blocks.find(ptr);
+            if (ptr_it != manager.m_allocated_blocks.end())
+            {
+                allocated_size = ptr_it->second;
+            }
+        }
 
-        if ( ptr_it == manager.m_allocated_blocks.end() )
+        if (allocated_size == 0)
         {
             FatalError("INTERNAL ERROR: Invalid call to cudaFreeAsync", AMGX_ERR_UNKNOWN);
         }
 
-        pool->add_memory(ptr, ptr_it->second);
-        manager.m_mutex.lock();
-        manager.m_allocated_blocks.erase(ptr_it);
-        manager.m_mutex.unlock();
+        pool->add_memory(ptr, allocated_size);
+        manager.remove_device_live_bytes(allocated_size);
+        {
+            std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+            manager.m_allocated_blocks.erase(ptr);
+        }
     }
     else
     {
 #ifdef AMGX_PRINT_MEMORY_INFO
         print_fallback = true;
 #endif
+        size_t allocated_size = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+            MemoryManager::MemoryBlockMap::iterator ptr_it = manager.m_allocated_blocks.find(ptr);
+            if (ptr_it != manager.m_allocated_blocks.end())
+            {
+                allocated_size = ptr_it->second;
+            }
+        }
+
         status = ::cudaFree(ptr);
         cudaCheckError();
+
+        if (status == cudaSuccess && allocated_size != 0)
+        {
+            std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+            manager.m_allocated_blocks.erase(ptr);
+            manager.remove_device_live_bytes(allocated_size);
+            manager.remove_device_reserved_bytes(allocated_size);
+        }
     }
 
 #ifdef AMGX_PRINT_MEMORY_INFO
@@ -1124,16 +1279,57 @@ void printInfo()
     //
 }
 
+DeviceMemoryStats getDeviceMemoryStats()
+{
+    MemoryManager &manager = MemoryManager::get_instance();
+    std::lock_guard<std::recursive_mutex> lock(manager.m_mutex);
+    DeviceMemoryStats stats = {0, 0, 0, 0};
+
+    if (manager.m_main_device_pool != NULL)
+    {
+        size_t used = 0, reserved = 0;
+        manager.m_main_device_pool->get_memory_stats(used, reserved);
+        stats.live_bytes += used;
+        stats.reserved_bytes += reserved;
+    }
+
+    for (MemoryManager::DevicePoolMap::const_iterator it = manager.m_thread_device_pools.begin();
+         it != manager.m_thread_device_pools.end(); ++it)
+    {
+        if (it->second != NULL && it->second != manager.m_main_device_pool)
+        {
+            size_t used = 0, reserved = 0;
+            it->second->get_memory_stats(used, reserved);
+            stats.live_bytes += used;
+            stats.reserved_bytes += reserved;
+        }
+    }
+
+    for (MemoryManager::MemoryBlockMap::const_iterator it = manager.m_allocated_blocks.begin();
+         it != manager.m_allocated_blocks.end(); ++it)
+    {
+        stats.live_bytes += it->second;
+        stats.reserved_bytes += it->second;
+    }
+
+    manager.m_device_peak_live_bytes = std::max(manager.m_device_peak_live_bytes, stats.live_bytes);
+    manager.m_device_peak_reserved_bytes = std::max(manager.m_device_peak_reserved_bytes, stats.reserved_bytes);
+    stats.peak_live_bytes = manager.m_device_peak_live_bytes;
+    stats.peak_reserved_bytes = manager.m_device_peak_reserved_bytes;
+    return stats;
+}
+
 void expandDeviceMemoryPool(size_t size, size_t max_block_size)
 {
     MemoryManager &manager = MemoryManager::get_instance();
 
     if (manager.m_main_device_pool)
     {
+        size_t before = manager.m_main_device_pool->get_reserved_mem();
         manager.m_main_device_pool->expandPool(size, max_block_size);
+        manager.add_device_reserved_bytes(manager.m_main_device_pool->get_reserved_mem() - before);
     }
 }
 
 } // namespace memory
 } // namespace amgx
-

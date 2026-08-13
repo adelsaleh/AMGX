@@ -70,6 +70,8 @@ EigenSolver<TConfig>::EigenSolver(AMG_Config &cfg, const std::string &cfg_scope)
     cudaCheckError();
     m_setup_time = 0.0f;
     m_solve_time = 0.0f;
+    m_setup_time_for_solve = 0.0f;
+    m_setup_time_pending = false;
 }
 
 template <class TConfig>
@@ -146,6 +148,7 @@ void EigenSolver<TConfig>::setup(Operator<TConfig> &A)
     cudaCheckError();
     cudaEventElapsedTime(&m_setup_time, m_setup_start, m_setup_stop);
     m_setup_time *= 1e-3f;
+    m_setup_time_pending = true;
 }
 
 template<class TConfig>
@@ -227,6 +230,8 @@ AMGX_STATUS EigenSolver<TConfig>::solve(VVector &x)
     x.delayed_send = 1;
     m_eigenvectors.clear();
     m_eigenvalues.clear();
+    m_setup_time_for_solve = m_setup_time_pending ? m_setup_time : 0.0f;
+    m_setup_time_pending = false;
 #ifdef AMGX_WITH_MPI
 #ifdef MPI_SOLVE_PROFILE
     MPI_Barrier(MPI_COMM_WORLD);
@@ -345,8 +350,14 @@ template<class TConfig>
 void EigenSolver<TConfig>::print_timings()
 {
     std::stringstream ss;
-    ss << "Total Time: " << m_setup_time + m_solve_time << std::endl;
-    ss << "    setup: " << m_setup_time << " s\n";
+    ss << "Total Time: " << m_setup_time_for_solve + m_solve_time << std::endl;
+    ss << "    setup: " << m_setup_time_for_solve << " s\n";
+
+    if (m_setup_time_for_solve == 0.0f && m_setup_time > 0.0f)
+    {
+        ss << "    cached setup (last, not included): " << m_setup_time << " s\n";
+    }
+
     ss << "    solve: " << m_solve_time << " s\n";
     ss << "    solve(per iteration): " << ((m_num_iters == 0) ? m_num_iters : m_solve_time / m_num_iters) << " s\n";
     amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
@@ -358,20 +369,25 @@ void EigenSolver<TConfig>::print_iter_stats()
     if (m_curr_iter == 0)
     {
         std::stringstream ss;
-        ss << std::setw(15) << "iter" << std::setw(20) << " Mem Usage (GB)"
-           << std::setw(15) << "residual";
-        ss << std::setw(15) << "rate";
+        ss << std::setw(8) << "iter"
+           << std::setw(10) << "used"
+           << std::setw(10) << "held"
+           << std::setw(15) << "residual"
+           << std::setw(15) << "res/previous";
         ss << std::endl;
-        ss
-                << "         --------------------------------------------------------------";
+        ss << std::setw(8) << "" << std::setw(10) << "GiB" << std::setw(10) << "GiB";
+        ss << std::endl;
+        ss << "  " << std::string(58, '-');
         ss << std::endl;
         amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
     }
 
     std::stringstream ss;
-    ss << std::setw(15) << m_curr_iter;
+    ss << std::setw(8) << m_curr_iter;
     MemoryInfo::updateMaxMemoryUsage();
-    ss << std::setw(20) << MemoryInfo::getMaxMemoryUsage();
+    ss << std::fixed << std::setprecision(3)
+       << std::setw(10) << MemoryInfo::getMemoryUsage()
+       << std::setw(10) << MemoryInfo::getReservedMemoryUsage();
     PODValueB iter_residual = m_residuals[m_curr_iter];
 
     if (iter_residual >= 0)
@@ -399,7 +415,11 @@ template <typename TConfig>
 void EigenSolver<TConfig>::print_final_stats()
 {
     std::stringstream ss;
-    ss << "         --------------------------------------------------------------";
+    ss << "  " << std::string(58, '-');
+    ss << std::endl;
+    ss << "         AMGX memory (process, GiB): sampled process peak used="
+       << std::fixed << std::setprecision(3) << MemoryInfo::getMaxMemoryUsage()
+       << " held=" << MemoryInfo::getMaxReservedMemoryUsage();
     ss << std::endl;
     amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
 }

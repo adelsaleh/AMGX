@@ -42,6 +42,9 @@ class BiCGStab_Solver : public Solver<T_Config>
 
         bool getInsertDiagonalDesired() const { return false; }
 
+        MonitoredResidualKind getMonitoredResidualKind() const
+        { return MONITORED_RESIDUAL_RECURSIVE_VERIFIED; }
+
         // Initialize the solver before running the iterations.
         void solve_init( VVector &b, VVector &x, bool xIsZero );
         // Run a single iteration. Compute the residual and its norm and decide convergence

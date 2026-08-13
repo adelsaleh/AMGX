@@ -3719,6 +3719,34 @@ extern "C" {
         return AMGX_RC_OK;
     }
 
+    AMGX_RC AMGX_API AMGX_get_device_memory_stats(
+        size_t *live_bytes,
+        size_t *reserved_bytes,
+        size_t *peak_live_bytes,
+        size_t *peak_reserved_bytes)
+    {
+        nvtxRange nvrf(__func__);
+
+        if (live_bytes == NULL || reserved_bytes == NULL ||
+            peak_live_bytes == NULL || peak_reserved_bytes == NULL)
+        {
+            return AMGX_RC_BAD_PARAMETERS;
+        }
+
+        AMGX_ERROR rc = AMGX_OK;
+        AMGX_TRIES()
+        {
+            const memory::DeviceMemoryStats stats = memory::getDeviceMemoryStats();
+            *live_bytes = stats.live_bytes;
+            *reserved_bytes = stats.reserved_bytes;
+            *peak_live_bytes = stats.peak_live_bytes;
+            *peak_reserved_bytes = stats.peak_reserved_bytes;
+        }
+        AMGX_CATCHES(rc)
+        AMGX_CHECK_API_ERROR_NORSRC(rc)
+        return AMGX_RC_OK;
+    }
+
     AMGX_RC AMGX_pin_memory_impl(void *ptr, unsigned int bytes)
     {
         AMGX_CPU_PROFILER( "AMGX_pin_memory " );

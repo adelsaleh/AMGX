@@ -114,7 +114,8 @@ int AMGX_GetErrorString( AMGX_ERROR error, char *buffer, int buf_len);
   if(e!=cudaSuccess) {                                                  \
     std::stringstream _error;                                           \
     _error << "Cuda failure: '" << cudaGetErrorString(e) << "'";        \
-    FatalError(_error.str(), AMGX_ERR_CUDA_FAILURE);                   \
+    FatalError(_error.str(), e == cudaErrorMemoryAllocation            \
+        ? AMGX_ERR_NO_MEMORY : AMGX_ERR_CUDA_FAILURE);                 \
   }                                                                     \
 }
 
@@ -125,7 +126,8 @@ int AMGX_GetErrorString( AMGX_ERROR error, char *buffer, int buf_len);
   if(e!=cudaSuccess) {                                                  \
     std::stringstream _error;                                           \
     _error << "Cuda failure: '" << cudaGetErrorString(e) << "'";        \
-    FatalError(_error.str(), AMGX_ERR_CUDA_FAILURE);                   \
+    FatalError(_error.str(), e == cudaErrorMemoryAllocation            \
+        ? AMGX_ERR_NO_MEMORY : AMGX_ERR_CUDA_FAILURE);                 \
   }                                                                     \
 }
 #endif
@@ -142,12 +144,12 @@ int AMGX_GetErrorString( AMGX_ERROR error, char *buffer, int buf_len);
         + std::string(e.where()) + "\nStack trace:\n" + std::string(e.trace()) + "\n";               \
     error_output(err.c_str(), static_cast<int>(err.length()));                                       \
     rc = e.reason();                                                                                 \
-  } catch (amgx::thrust::system_error &e) {                                                                \
-    std::string err = "Thrust failure: " + std::string(e.what())                                     \
+  } catch (amgx::thrust::system::detail::bad_alloc e) {                                                    \
+    std::string err = "Not enough memory: " + std::string(e.what())                                  \
         + "\nFile and line number are not available for this exception.\n";                          \
     error_output(err.c_str(), static_cast<int>(err.length()));                                       \
-    rc = AMGX_ERR_THRUST_FAILURE;                                                                   \
-  } catch (amgx::thrust::system::detail::bad_alloc e) {                                                    \
+    rc = AMGX_ERR_NO_MEMORY;                                                                        \
+  } catch (amgx::thrust::system_error &e) {                                                                \
     std::string err = "Thrust failure: " + std::string(e.what())                                     \
         + "\nFile and line number are not available for this exception.\n";                          \
     error_output(err.c_str(), static_cast<int>(err.length()));                                       \
