@@ -738,6 +738,154 @@ void jacobiSmooth4by4BlockDiaCsrKernel_NAIVE_tex_readDinv2(const IndexType *row_
     }
 }
 
+// Fused block-Jacobi sweep for the small non-power-of-two block sizes that do
+// not use the specialized 4x4 kernel. The legacy path launches one BSR SpMV
+// for b-Ax and a second BSR SpMV for D^{-1}(b-Ax). Keeping the residual in
+// registers avoids the intermediate vector, copy, and second sparse launch.
+template<int bsize, typename IndexType, typename ValueTypeA, typename ValueTypeB>
+__global__
+void jacobiSmoothSmallBlockDiaCsrKernel(const IndexType *row_offsets, const IndexType *column_indices,
+                                        const ValueTypeA *nonzero_values, const ValueTypeA *Dinv,
+                                        const ValueTypeB *b, const ValueTypeB *x, double weight,
+                                        const IndexType num_block_rows, ValueTypeB *xout,
+                                        const IndexType row_offset)
+{
+    IndexType local_row = blockDim.x * blockIdx.x + threadIdx.x;
+
+    while (local_row < num_block_rows)
+    {
+        const IndexType row = row_offset + local_row;
+        ValueTypeB residual[bsize];
+
+#pragma unroll
+        for (int r = 0; r < bsize; r++)
+        {
+            residual[r] = b[row * bsize + r];
+        }
+
+        const IndexType row_end = __cachingLoad(&row_offsets[row + 1]);
+
+        for (IndexType block = __cachingLoad(&row_offsets[row]); block < row_end; block++)
+        {
+            const IndexType column = __cachingLoad(&column_indices[block]);
+            const IndexType value_offset = block * bsize * bsize;
+
+#pragma unroll
+            for (int r = 0; r < bsize; r++)
+            {
+#pragma unroll
+                for (int c = 0; c < bsize; c++)
+                {
+                    residual[r] = residual[r]
+                                  - __cachingLoad(&nonzero_values[value_offset + r * bsize + c])
+                                  * __cachingLoad(&x[column * bsize + c]);
+                }
+            }
+        }
+
+        const IndexType diagonal_offset = row * bsize * bsize;
+
+#pragma unroll
+        for (int r = 0; r < bsize; r++)
+        {
+            ValueTypeB correction = types::util<ValueTypeB>::get_zero();
+
+#pragma unroll
+            for (int c = 0; c < bsize; c++)
+            {
+                correction = correction
+                             + __cachingLoad(&Dinv[diagonal_offset + r * bsize + c]) * residual[c];
+            }
+
+            xout[row * bsize + r] = x[row * bsize + r] + correction * weight;
+        }
+
+        local_row += gridDim.x * blockDim.x;
+    }
+}
+
+// Fused 5x5 block-Jacobi sweep using one eight-thread subgroup per block
+// row. Five lanes form the five residual components concurrently, then apply
+// one row of the inverse diagonal block. The three spare lanes keep subgroup
+// boundaries power-of-two and aligned inside a warp.
+template<typename IndexType, typename ValueTypeA, typename ValueTypeB>
+__global__
+void jacobiSmooth5x5SubgroupBlockDiaCsrKernel(const IndexType *row_offsets,
+                                               const IndexType *column_indices,
+                                               const ValueTypeA *nonzero_values,
+                                               const ValueTypeA *Dinv,
+                                               const ValueTypeB *b,
+                                               const ValueTypeB *x,
+                                               double weight,
+                                               const IndexType num_block_rows,
+                                               ValueTypeB *xout,
+                                               const IndexType row_offset)
+{
+    const int subgroup_width = 8;
+    const int block_size = 5;
+    const int subgroups_per_block = 128 / subgroup_width;
+    const int subgroup = threadIdx.x / subgroup_width;
+    const int lane = threadIdx.x % subgroup_width;
+    __shared__ ValueTypeB residuals[subgroups_per_block * block_size];
+
+    for (IndexType block_row_base = blockIdx.x * subgroups_per_block;
+         block_row_base < num_block_rows;
+         block_row_base += gridDim.x * subgroups_per_block)
+    {
+        const IndexType local_row = block_row_base + subgroup;
+        const bool active = local_row < num_block_rows && lane < block_size;
+
+        if (active)
+        {
+            const IndexType row = row_offset + local_row;
+            ValueTypeB residual = b[row * block_size + lane];
+            const IndexType row_end = __cachingLoad(&row_offsets[row + 1]);
+
+            for (IndexType block = __cachingLoad(&row_offsets[row]); block < row_end; block++)
+            {
+                const IndexType column = __cachingLoad(&column_indices[block]);
+                const IndexType value_offset = block * block_size * block_size
+                                               + lane * block_size;
+
+#pragma unroll
+                for (int c = 0; c < block_size; c++)
+                {
+                    residual = residual
+                               - __cachingLoad(&nonzero_values[value_offset + c])
+                               * __cachingLoad(&x[column * block_size + c]);
+                }
+            }
+
+            residuals[subgroup * block_size + lane] = residual;
+        }
+
+        __syncthreads();
+
+        if (active)
+        {
+            const IndexType row = row_offset + local_row;
+            const IndexType diagonal_offset = row * block_size * block_size
+                                              + lane * block_size;
+            ValueTypeB correction = types::util<ValueTypeB>::get_zero();
+
+#pragma unroll
+            for (int c = 0; c < block_size; c++)
+            {
+                correction = correction
+                             + __cachingLoad(&Dinv[diagonal_offset + c])
+                             * residuals[subgroup * block_size + c];
+            }
+
+            xout[row * block_size + lane] = x[row * block_size + lane]
+                                             + correction * weight;
+        }
+
+        // Prevent a fast subgroup from overwriting shared residuals while a
+        // neighboring subgroup is still consuming the current iteration.
+        __syncthreads();
+    }
+}
+
 // Kernel to smooth with jacobi smoother, zero initial guess
 template<typename IndexType, typename ValueTypeA, typename ValueTypeB, int eighthwarps_per_block, int bsize, int log_bsize, int half_bsize>
 __global__
@@ -781,6 +929,10 @@ template<class T_Config>
 BlockJacobiSolver_Base<T_Config>::BlockJacobiSolver_Base( AMG_Config &cfg, const std::string &cfg_scope) : Solver<T_Config>( cfg, cfg_scope)
 {
     weight = cfg.AMG_Config::template getParameter<double>("relaxation_factor", cfg_scope);
+    use_fused_small_blocks = cfg.AMG_Config::template getParameter<int>("block_jacobi_use_fused_small_blocks", cfg_scope) != 0;
+    const std::string spmv_backend = cfg.AMG_Config::template getParameter<std::string>("bsr_spmv_backend", cfg_scope);
+    bsr_spmv_backend = spmv_backend == "cusparse_generic" ? 1
+                       : spmv_backend == "custom_5x5" ? 2 : 0;
 
     if (weight == 0)
     {
@@ -801,6 +953,11 @@ void
 BlockJacobiSolver_Base<T_Config>::printSolverParameters() const
 {
     std::cout << "relaxation_factor= " << this->weight << std::endl;
+    std::cout << "block_jacobi_use_fused_small_blocks= " << this->use_fused_small_blocks << std::endl;
+    std::cout << "bsr_spmv_backend= "
+              << (this->bsr_spmv_backend == 1 ? "cusparse_generic"
+                  : this->bsr_spmv_backend == 2 ? "custom_5x5" : "legacy")
+              << std::endl;
 }
 
 // Solver setup
@@ -816,6 +973,21 @@ BlockJacobiSolver_Base<T_Config>::solver_setup(bool reuse_matrix_structure)
     }
 
     computeDinv( *A_as_matrix );
+    int effective_spmv_backend = this->bsr_spmv_backend;
+#if CUDART_VERSION < 13000
+    if (effective_spmv_backend == 1)
+    {
+        if (A_as_matrix->amg_level_index == 0)
+        {
+            amgx_printf("Warning: bsr_spmv_backend=cusparse_generic requires "
+                        "CUDA Toolkit 13.0 or newer; falling back to legacy BSR SpMV.\n");
+        }
+        effective_spmv_backend = 0;
+    }
+#endif
+    A_as_matrix->setParameter("bsr_spmv_backend", effective_spmv_backend);
+    A_as_matrix->setParameter("use_subgroup_5x5_spmv",
+                              (int) (effective_spmv_backend == 2));
 
     if ( A_as_matrix->getBlockFormat() != ROW_MAJOR )
     {
@@ -1352,6 +1524,53 @@ void BlockJacobiSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPr
     IndexType num_rows;
     IndexType offset;
     A.getOffsetAndSizeForView(separation_flags, &offset, &num_rows);
+
+    const int bsize = A.get_block_dimx();
+
+    if (this->use_fused_small_blocks && (bsize == 2 || bsize == 3 || bsize == 5))
+    {
+        if (this->t_res.size() != x.size())
+        {
+            this->t_res.resize(x.size());
+        }
+
+        if (!A.is_matrix_singleGPU())
+        {
+            A.manager->exchange_halo(x, x.tag);
+        }
+
+        const int threads_per_block = 128;
+        const int num_blocks = std::min(AMGX_GRID_MAX_SIZE,
+                                        (int) (num_rows - 1) / threads_per_block + 1);
+
+        if (bsize == 2)
+        {
+            jacobiSmoothSmallBlockDiaCsrKernel<2><<<num_blocks, threads_per_block>>>(
+                A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(), this->Dinv.raw(),
+                b.raw(), x.raw(), this->weight, num_rows, this->t_res.raw(), offset);
+        }
+        else if (bsize == 3)
+        {
+            jacobiSmoothSmallBlockDiaCsrKernel<3><<<num_blocks, threads_per_block>>>(
+                A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(), this->Dinv.raw(),
+                b.raw(), x.raw(), this->weight, num_rows, this->t_res.raw(), offset);
+        }
+        else
+        {
+            const int subgroup_width = 8;
+            const int subgroups_per_block = threads_per_block / subgroup_width;
+            const int subgroup_num_blocks = std::min(
+                AMGX_GRID_MAX_SIZE,
+                (int) (num_rows - 1) / subgroups_per_block + 1);
+            jacobiSmooth5x5SubgroupBlockDiaCsrKernel<<<subgroup_num_blocks, threads_per_block>>>(
+                A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(), this->Dinv.raw(),
+                b.raw(), x.raw(), this->weight, num_rows, this->t_res.raw(), offset);
+        }
+
+        cudaCheckError();
+        x.swap(this->t_res);
+        return;
+    }
 
     // aux vector initialization
     if (this->y.size() != b.size())

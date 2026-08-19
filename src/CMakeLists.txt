@@ -8,6 +8,10 @@ cmake_minimum_required (VERSION 3.18)
 FILE(GLOB_RECURSE SRCS "*.cu")
 list(FILTER SRCS EXCLUDE REGEX "/src/tests/")
 list(FILTER SRCS EXCLUDE REGEX "/utest.cu")
+# Keep the new classical block-graph module visible to already-configured
+# build trees; the explicit append also makes its ownership easy to find.
+list(APPEND SRCS "${CMAKE_CURRENT_SOURCE_DIR}/classical/block_graph.cu")
+list(REMOVE_DUPLICATES SRCS)
 
 target_sources(amgx_libs PRIVATE ${SRCS})
 
@@ -21,7 +25,8 @@ set(tests_all ${tests_all}
     unit_test.cu
     tests/device_memory_stats.cu
     tests/gmres_reliable_residual.cu
-    tests/bicgstab_residual.cu)
+    tests/bicgstab_residual.cu
+    tests/dense_lu.cu)
 
 add_library(amgx_tests_libs OBJECT ${tests_all})
 

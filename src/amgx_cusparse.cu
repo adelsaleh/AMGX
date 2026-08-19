@@ -11,6 +11,7 @@
 #include <util.h>
 #include <sm_utils.inl>
 #include <device_properties.h>
+#include <type_traits>
 
 #include <amgx_cusparse.h>
 
@@ -27,6 +28,18 @@
 
 namespace amgx
 {
+
+#if CUDART_VERSION >= 13000
+template<class ValueType, class IndType>
+inline void generic_BSR_SpMV(cusparseHandle_t handle,
+                             int block_rows, int block_cols, int block_nnz,
+                             int block_dim, const ValueType *alpha,
+                             const ValueType *values, const IndType *row_offsets,
+                             const IndType *column_indices, const ValueType *x,
+                             const ValueType *beta, ValueType *y,
+                             cudaDataType value_type, cusparseOrder_t block_order,
+                             const cudaStream_t &stream);
+#endif
 
 Cusparse::Cusparse() : m_handle(0), m_determinism_flag(false)
 {
@@ -554,6 +567,55 @@ void Cusparse::bsrmv_internal( const typename TConfig::VecPrec alphaConst,
 
     bool has_offdiag = nnz != 0;
 
+#if CUDART_VERSION >= 13000
+    const int requested_backend = A.template getParameter<int>("bsr_spmv_backend");
+    if constexpr (TConfig::memSpace == AMGX_device
+                  && std::is_same<typename TConfig::MatPrec,
+                                  typename TConfig::VecPrec>::value
+                  && (std::is_same<typename TConfig::MatPrec, float>::value
+                      || std::is_same<typename TConfig::MatPrec, double>::value))
+    {
+        const bool complete_view = rowOff == 0
+                                   && nrows == static_cast<int>(A.row_offsets.size()) - 1;
+        if (requested_backend == 1 && complete_view
+            && A.get_block_dimx() == A.get_block_dimy()
+            && A.get_block_dimx() > 1)
+        {
+            typedef typename TConfig::MatPrec ValueTypeA;
+            const cudaDataType value_type = std::is_same<ValueTypeA, double>::value
+                                            ? CUDA_R_64F : CUDA_R_32F;
+            const cusparseOrder_t block_order = A.getBlockFormat() == ROW_MAJOR
+                                                ? CUSPARSE_ORDER_ROW
+                                                : CUSPARSE_ORDER_COL;
+            cusparseCheckError(cusparseSetStream(Cusparse::get_instance().m_handle, stream));
+
+            if (has_offdiag)
+            {
+                generic_BSR_SpMV(
+                    Cusparse::get_instance().m_handle, nrows, A.get_num_cols(), nnz,
+                    A.get_block_dimx(), &alphaConst, A.values.raw(),
+                    A.row_offsets.raw(), A.col_indices.raw(), x.raw(), &betaConst,
+                    y.raw(), value_type, block_order, stream);
+            }
+
+            if (A.hasProps(DIAG))
+            {
+                const ValueTypeB diagonal_beta = has_offdiag
+                    ? types::util<ValueTypeB>::get_one() : betaConst;
+                generic_BSR_SpMV(
+                    Cusparse::get_instance().m_handle, nrows, A.get_num_cols(), nrows,
+                    A.get_block_dimx(), &alphaConst,
+                    A.values.raw() + A.diagOffset() * A.get_block_size(),
+                    A.m_seq_offsets.raw(), A.m_seq_offsets.raw(), x.raw(),
+                    &diagonal_beta, y.raw(), value_type, block_order, stream);
+            }
+
+            cusparseCheckError(cusparseSetStream(Cusparse::get_instance().m_handle, 0));
+            return;
+        }
+    }
+#endif
+
     if (has_offdiag )
     {
         bsrmv( Cusparse::get_instance().m_handle,  direction, CUSPARSE_OPERATION_NON_TRANSPOSE,
@@ -1022,6 +1084,65 @@ __global__ void csrmv(
         }
     }
 }
+
+#if CUDART_VERSION >= 13000
+template<class ValueType, class IndType>
+inline void generic_BSR_SpMV(cusparseHandle_t handle,
+                             int block_rows, int block_cols, int block_nnz,
+                             int block_dim, const ValueType *alpha,
+                             const ValueType *values, const IndType *row_offsets,
+                             const IndType *column_indices, const ValueType *x,
+                             const ValueType *beta, ValueType *y,
+                             cudaDataType value_type, cusparseOrder_t block_order,
+                             const cudaStream_t &stream)
+{
+    cusparseSpMatDescr_t matrix_descr;
+    cusparseDnVecDescr_t x_descr;
+    cusparseDnVecDescr_t y_descr;
+    cusparseCheckError(cusparseCreateBsr(
+        &matrix_descr, block_rows, block_cols, block_nnz, block_dim, block_dim,
+        const_cast<IndType *>(row_offsets), const_cast<IndType *>(column_indices),
+        const_cast<ValueType *>(values), CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO, value_type, block_order));
+    cusparseCheckError(cusparseCreateDnVec(
+        &x_descr, static_cast<int64_t>(block_cols) * block_dim,
+        const_cast<ValueType *>(x), value_type));
+    cusparseCheckError(cusparseCreateDnVec(
+        &y_descr, static_cast<int64_t>(block_rows) * block_dim, y, value_type));
+
+    size_t buffer_size = 0;
+    const cusparseSpMVAlg_t algorithm = CUSPARSE_SPMV_BSR_ALG1;
+    cusparseCheckError(cusparseSpMV_bufferSize(
+        handle, CUSPARSE_OPERATION_NON_TRANSPOSE, alpha, matrix_descr, x_descr,
+        beta, y_descr, value_type, algorithm, &buffer_size));
+
+    void *buffer = NULL;
+    if (buffer_size > 0)
+    {
+        cudaError_t status = amgx::memory::cudaMallocAsync(&buffer, buffer_size, stream);
+        if (status != cudaSuccess)
+        {
+            FatalError("cudaMallocAsync failed in generic_BSR_SpMV", AMGX_ERR_CUDA_FAILURE);
+        }
+    }
+
+    cusparseCheckError(cusparseSpMV(
+        handle, CUSPARSE_OPERATION_NON_TRANSPOSE, alpha, matrix_descr, x_descr,
+        beta, y_descr, value_type, algorithm, buffer));
+
+    cusparseCheckError(cusparseDestroySpMat(matrix_descr));
+    cusparseCheckError(cusparseDestroyDnVec(x_descr));
+    cusparseCheckError(cusparseDestroyDnVec(y_descr));
+    if (buffer_size > 0)
+    {
+        cudaError_t status = amgx::memory::cudaFreeAsync(buffer);
+        if (status != cudaSuccess)
+        {
+            FatalError("cudaFreeAsync failed in generic_BSR_SpMV", AMGX_ERR_CUDA_FAILURE);
+        }
+    }
+}
+#endif
 
 template<class MatType, class VecType, class IndType>
 inline void generic_SpMV(cusparseHandle_t handle, cusparseOperation_t trans,

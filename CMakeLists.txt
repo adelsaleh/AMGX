@@ -119,7 +119,8 @@ endif()
 list(FIND CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES
      "${CMAKE_INSTALL_PREFIX}/lib" isSystemDir)
 if("${isSystemDir}" STREQUAL "-1")
-  set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+  list(APPEND CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+  list(REMOVE_DUPLICATES CMAKE_INSTALL_RPATH)
 endif()
 # add the automatically determined parts of the RPATH
 # which point to directories outside the build tree to the install RPATH

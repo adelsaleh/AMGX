@@ -321,6 +321,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("matrix_consolidation_lower_threshold", "Average number of rows at which matrices from different processes must be merged", 0);
     AMG_Config::registerParameter<int>("matrix_consolidation_upper_threshold", "Average number of rows that merged matrices from different processes should have", 1000);
     //Register System Parameters (memory pools)
+    AMG_Config::registerParameter<int>("device_mem_pool_enabled", "flag that enables the AMGX device memory pool <0|1>", 1, bool_flag_values);
     AMG_Config::registerParameter<size_t>("device_mem_pool_size", "size of the device memory pool in bytes", 256 * 1024 * 1024);
     AMG_Config::registerParameter<size_t>("device_consolidation_pool_size", "size of the device memory pool for root partition in bytes", 256 * 1024 * 1024);
     AMG_Config::registerParameter<size_t>("device_mem_pool_max_alloc_size", "maximum size of a single allocation in the device memory pool in bytes", 20 * 1024 * 1024);
@@ -402,6 +403,13 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("dense_lu_max_rows", "the dense LU solver will not be triggered if the matrix size >= dense_lu_max_rows > 0 (not used by default)", 0);
     //Richardson's iteration - relaxation parameter
     AMG_Config::registerParameter<double>("relaxation_factor", "the relaxation factor used in a solver", 0.9, 0.0, 2.0);
+    AMG_Config::registerParameter<int>("jacobi_l1_scalar_rows_for_blocks", "treat each scalar row of a BSR matrix exactly as scalar CSR in JACOBI_L1 <0|1>", 0, 0, 1);
+    AMG_Config::registerParameter<int>("block_jacobi_use_fused_small_blocks", "Use fused residual/update kernels for 2x2 and 3x3 blocks and a subgroup-per-row kernel for 5x5 device block Jacobi <0|1>", 0, bool_flag_values);
+    std::vector<std::string> bsr_spmv_backend_values;
+    bsr_spmv_backend_values.push_back("legacy");
+    bsr_spmv_backend_values.push_back("cusparse_generic");
+    bsr_spmv_backend_values.push_back("custom_5x5");
+    AMG_Config::registerParameter<std::string>("bsr_spmv_backend", "BSR SpMV implementation <legacy|cusparse_generic|custom_5x5>", "legacy", bsr_spmv_backend_values);
     //Richardson's iteration - ILU
     AMG_Config::registerParameter<int>("ilu_sparsity_level", "The multicolor_ilu solver sparsity level. 0:ILU0, 1:ILU1, etc <0>", 0);
     //Richardson's iteration - GS
@@ -454,6 +462,59 @@ inline void registerParameters()
     AMG_Config::registerParameter<std::string>("coarseAgenerator", "the method used to compute the Galerkin product in Agg-AMG <LOW_DEG|THRUST|HYBRID>", "LOW_DEG", coarse_gen_values);
     AMG_Config::registerParameter<std::string>("coarseAgenerator_coarse", "the method used to compute the Galerkin product in Agg-AMG  for coarser levels <LOW_DEG|THRUST|HYBRID>", "LOW_DEG", coarse_gen_values);
     //Classical (Interpolators)
+    AMG_Config::registerParameter<std::string>(
+        "classical_bsr_hierarchy",
+        "classical AMG hierarchy for block matrices "
+        "<scalar_expand|block_graph_identity|block_graph_dense>",
+        "scalar_expand");
+    std::vector<std::string> block_graph_strength_metrics;
+    block_graph_strength_metrics.push_back("frobenius");
+    block_graph_strength_metrics.push_back("diagonal_normalized_frobenius");
+    block_graph_strength_metrics.push_back("symmetric_inverse_diagonal_frobenius");
+    std::vector<std::string> block_graph_coarse_selectors;
+    block_graph_coarse_selectors.push_back("block_graph");
+    block_graph_coarse_selectors.push_back("scalar_guided_any");
+    AMG_Config::registerParameter<std::string>(
+        "block_graph_coarse_selector",
+        "coarse-face selection for pure-BSR block graphs "
+        "<block_graph|scalar_guided_any>",
+        "block_graph", block_graph_coarse_selectors);
+    AMG_Config::registerParameter<std::string>(
+        "block_graph_strength_metric",
+        "scalar coupling metric for pure-BSR block graphs "
+        "<frobenius|diagonal_normalized_frobenius|"
+        "symmetric_inverse_diagonal_frobenius>",
+        "frobenius", block_graph_strength_metrics);
+    std::vector<std::string> block_graph_dense_interpolation_modes;
+    block_graph_dense_interpolation_modes.push_back("jacobi");
+    block_graph_dense_interpolation_modes.push_back("extended_i");
+    AMG_Config::registerParameter<std::string>(
+        "block_graph_dense_interpolation_mode",
+        "dense block interpolation <jacobi|extended_i>",
+        "jacobi", block_graph_dense_interpolation_modes);
+    AMG_Config::registerParameter<double>(
+        "block_graph_dense_smoothing_weight",
+        "Jacobi smoothing weight for dense block-graph interpolation <0.6666666666666666>",
+        2.0 / 3.0);
+    AMG_Config::registerParameter<int>(
+        "block_graph_dense_smoothing_steps",
+        "number of projected block-Jacobi interpolation smoothing steps <1>",
+        1, 1, 8);
+    std::vector<std::string> block_graph_dense_constraint_modes;
+    block_graph_dense_constraint_modes.push_back("additive");
+    block_graph_dense_constraint_modes.push_back("right_normalize");
+    AMG_Config::registerParameter<std::string>(
+        "block_graph_dense_constraint_mode",
+        "block constant-mode enforcement <additive|right_normalize>",
+        "additive", block_graph_dense_constraint_modes);
+    AMG_Config::registerParameter<double>(
+        "block_graph_dense_pivot_tolerance",
+        "relative pivot tolerance for dense block interpolation diagonal solves <1e-12>",
+        1.0e-12);
+    AMG_Config::registerParameter<double>(
+        "block_graph_dense_constraint_tolerance",
+        "absolute validation tolerance for sum_c P_ic = I_b <1e-8>",
+        1.0e-8);
     AMG_Config::registerParameter<std::string>("interpolator", "the interpolation algorithm <D1|D2|MULTIPASS>", "D1", getAllInterpolators());
     //Energymin (Interpolators)
     AMG_Config::registerParameter<std::string>("energymin_interpolator", "the energymin interpolation algorithm <EM>", "EM");
@@ -467,7 +528,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<std::string>("aggressive_selector", "the aggressive coarse grid selection algorithm, DEFAULT is same as \"selector\" (Classical only) <PMIS|HMIS|DEFAULT>", "DEFAULT", classical_selector_values);
     AMG_Config::registerParameter<std::string>("aggressive_interpolator", "the interpolation algorithm for aggressive coarsening (Classical only) <MULTIPASS>", "MULTIPASS", classical_selector_values);
     AMG_Config::registerParameter<int>("handshaking_phases", "number of handshaking phases for aggregation step, valid values are 1 or 2 phases <1>", 1);
-    AMG_Config::registerParameter<int>("aggregation_edge_weight_component", "The component in the block matrices to use to compute the edge weights in the aggregation procedure <0>", 0);
+    AMG_Config::registerParameter<int>("aggregation_edge_weight_component", "The diagonal component in block matrices used for aggregation edge weights; -1 uses a whole-block Frobenius norm with weight_formula=0 (SIZE_2 block selector) <0>", 0);
     AMG_Config::registerParameter<int>("max_matching_iterations", "the maximum number of 'matching' iterations in the size2_selector, size4_selector and size8_selector algorithms <15>", 15);
     AMG_Config::registerParameter<double>("max_unassigned_percentage", "the maximum percentage of vertices that are left unaggregated in first phase of matching algorithms <0.05>", 0.05);
     //Register Selector (MULTI_PAIRWISE) Parameters

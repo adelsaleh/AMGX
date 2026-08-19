@@ -58,7 +58,9 @@ Resources::Resources() : m_cfg_self(true), m_root_pool_expanded(false), m_tmng(n
     cudaFree(0);
     cudaCheckError();
     std::string solver_value, solver_scope, default_scope;
+    int use_device_mem_pool = 1;
     m_cfg->getParameter<std::string>("solver", solver_value, "default", solver_scope);
+    m_cfg->getParameter<int>("device_mem_pool_enabled", use_device_mem_pool, "default", solver_scope);
     m_cfg->getParameter<size_t>("device_mem_pool_size", m_pool_size, "default", solver_scope);
     m_cfg->getParameter<size_t>("device_mem_pool_size_limit", m_pool_size_limit, "default", solver_scope);
     m_cfg->getParameter<size_t>("device_consolidation_pool_size", m_root_pool_size, "default", solver_scope);
@@ -81,7 +83,7 @@ Resources::Resources() : m_cfg_self(true), m_root_pool_expanded(false), m_tmng(n
     //m_tmng->spawn_threads(m_pool_size, m_max_alloc_size);
     // reset settings to normal
     memory::setAsyncFreeFlag(false);
-    memory::setDeviceMemoryPoolFlag(true);
+    memory::setDeviceMemoryPoolFlag(use_device_mem_pool != 0);
     m_handle_errors = m_cfg->getParameter<int>("exception_handling", default_scope);
 }
 
@@ -91,7 +93,9 @@ Resources::Resources(AMG_Configuration *cfg, void *comm, int device_num, const i
     m_devices.clear();
     m_cfg = cfg->getConfigObject();
     std::string solver_value, solver_scope;
+    int use_device_mem_pool = 1;
     m_cfg->getParameter<std::string>("solver", solver_value, "default", solver_scope);
+    m_cfg->getParameter<int>("device_mem_pool_enabled", use_device_mem_pool, "default", solver_scope);
     m_cfg->getParameter<size_t>("device_mem_pool_size", m_pool_size, "default", solver_scope);
     m_cfg->getParameter<size_t>("device_mem_pool_size_limit", m_pool_size_limit, "default", solver_scope);
     m_cfg->getParameter<size_t>("device_consolidation_pool_size", m_root_pool_size, "default", solver_scope);
@@ -131,7 +135,7 @@ Resources::Resources(AMG_Configuration *cfg, void *comm, int device_num, const i
     //m_tmng->spawn_threads(m_pool_size, m_max_alloc_size);
     // reset settings to normal
     memory::setAsyncFreeFlag(false);
-    memory::setDeviceMemoryPoolFlag(true);
+    memory::setDeviceMemoryPoolFlag(use_device_mem_pool != 0);
     // create communicator
 #ifdef AMGX_WITH_MPI
     m_mpi_comm = (MPI_Comm *) comm;

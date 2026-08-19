@@ -69,15 +69,10 @@ void csr_to_dense_kernel(
     // The values in csr_vals has all entries in the blocks, using row major to
     // store the block. So we need the number of entries in each block as stride.
     const int block_mxn = block_num_rows * block_num_cols;
-    // Each lane copies one entry in a block and iterate through row sparsity pattern.
-    // Essentially one warp per row-block. For 4x4, we have 16 working threads per warp.
+    // Essentially one warp per row-block. Each lane copies block entries in
+    // warp-sized strides so blocks with more than 32 coefficients (for example,
+    // 6x6 and 7x7) are converted completely.
     const int lane_id = threadIdx.x % WARP_SIZE;
-    // find the (row,col) local to a block
-    const int block_row = lane_id / block_num_cols;
-    const int block_col = lane_id % block_num_cols;
-
-    // These are wasted threads per warp
-    if ( block_row >= block_num_rows ) { return; }
 
     // The first row to consider. One row per warp.
     int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
@@ -85,26 +80,35 @@ void csr_to_dense_kernel(
 
     for ( ; row < num_rows ; row += row_offset )
     {
-        int dense_row = row * block_num_rows + block_row;
-        // Iterate over each row and copy the elements into col-major A_dense
-        int row_end = A_csr_rows[row + 1];
+        const int row_end = A_csr_rows[row + 1];
 
-        for (int row_it = A_csr_rows[row]; row_it < row_end ; ++row_it )
+        for (int block_entry = lane_id; block_entry < block_mxn;
+             block_entry += WARP_SIZE)
         {
-            int col = A_csr_cols[row_it];
+            const int block_row = block_entry / block_num_cols;
+            const int block_col = block_entry % block_num_cols;
+            const int dense_row = row * block_num_rows + block_row;
 
-            if ( col >= num_rows ) { continue; } // Skip entries corresponding to halo
+            // Iterate over each row and copy the elements into col-major A_dense.
+            for (int row_it = A_csr_rows[row]; row_it < row_end; ++row_it)
+            {
+                const int col = A_csr_cols[row_it];
 
-            int dense_col = col * block_num_cols + block_col;
-            A_dense[dense_col * lda + dense_row] = A_csr_vals[block_mxn * row_it + lane_id];
-        }
+                if (col >= num_rows) { continue; } // Skip entries corresponding to halo.
 
-        // copy diagonal block
-        if ( A_csr_diag )
-        {
-            int diag_it = A_csr_diag[row];
-            int dense_col = row * block_num_cols + block_col; // diag means row=col
-            A_dense[dense_col * lda + dense_row] = A_csr_vals[block_mxn * diag_it + lane_id];
+                const int dense_col = col * block_num_cols + block_col;
+                A_dense[dense_col * lda + dense_row] =
+                    A_csr_vals[block_mxn * row_it + block_entry];
+            }
+
+            // Copy a separately stored diagonal block.
+            if (A_csr_diag)
+            {
+                const int diag_it = A_csr_diag[row];
+                const int dense_col = row * block_num_cols + block_col;
+                A_dense[dense_col * lda + dense_row] =
+                    A_csr_vals[block_mxn * diag_it + block_entry];
+            }
         }
     }
 }
@@ -543,21 +547,14 @@ void DenseLUSolver<TemplateConfig<AMGX_device, V, M, I> >::cudense_getrf()
         cudaMemcpy(&t_info, m_cuds_info, sizeof(int), cudaMemcpyDefault);
         cudaCheckError();
 
-        if (t_info != 0)
+        // We follow the standard established by LAPACK and used by cuSOLVER.
+        if (t_info > 0)
         {
-            FatalError( "Fail to get info from cudense", AMGX_ERR_INTERNAL);
+            FatalError( "Dense LU factorization failed due to a singular matrix", AMGX_ERR_INTERNAL);
         }
-        else
+        else if (t_info < 0)
         {
-            // We follow the standard established by Lapack and used in cudense.
-            if (t_info > 0)
-            {
-                FatalError( "Dense LU factorization failed due to a singular matrix", AMGX_ERR_INTERNAL);
-            }
-            else if (t_info < 0)
-            {
-                FatalError( "Invalid input parameter(s) to dense LU", AMGX_ERR_INTERNAL);
-            }
+            FatalError( "Invalid input parameter(s) to dense LU", AMGX_ERR_INTERNAL);
         }
     }
 

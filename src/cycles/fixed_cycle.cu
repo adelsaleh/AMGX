@@ -31,10 +31,25 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
     Solver<T_Config> *smoother = level->getSmoother();
     VVector &bc = level->getbc();
     bc.set_block_dimx(1);
-    bc.set_block_dimy(A.get_block_dimy());
     VVector &xc = level->getxc();
     xc.set_block_dimx(1);
-    xc.set_block_dimy(A.get_block_dimx());
+
+    // bc and xc live on the next-coarser level. Usually adjacent AMG
+    // levels have the same block dimensions, but the classical BSR adapter
+    // deliberately transitions from a block fine operator to a scalar CSR
+    // hierarchy. Preserve that transition here instead of re-tagging the
+    // coarse work vectors with the fine operator's block dimensions.
+    if (!level->isCoarsest())
+    {
+        Matrix<T_Config> &Ac = level->getNextLevel(MemorySpace())->getA();
+        bc.set_block_dimy(Ac.get_block_dimy());
+        xc.set_block_dimy(Ac.get_block_dimx());
+    }
+    else
+    {
+        bc.set_block_dimy(A.get_block_dimy());
+        xc.set_block_dimy(A.get_block_dimx());
+    }
     VVector &r = level->getr();
     int levelnum = A.template getParameter <int>("level");
     int *smoothing_direction = nullptr;

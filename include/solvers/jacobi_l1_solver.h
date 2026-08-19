@@ -36,6 +36,7 @@ class JacobiL1Solver_Base : public Solver<T_Config>
         // Override parent attribute.
         Matrix<T_Config> *m_explicit_A;
         ValueTypeB weight;
+        bool scalar_rows_for_blocks;
         MVector m_d;
         VVector y_tmp;
 

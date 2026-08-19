@@ -185,6 +185,8 @@ class MatrixBase : public AuxData, public Operator<T_Config>
         void setDefaultParameters()
         {
             this->setParameter("level", (int)(0));
+            this->setParameter("use_subgroup_5x5_spmv", (int)(0));
+            this->setParameter("bsr_spmv_backend", (int)(0));
         }
 
         MatrixBase() :  m_is_read_partitioned(false), manager(NULL), amg_level_index(0), manager_internal(true), props(NONE), num_rows(0), num_cols(0), num_nz(0), block_dimy(1), block_dimx(1), block_size(1), m_initialized(0), row_offsets(0), col_indices(0), values(0), row_indices(0), diag(0), current_view(ALL), m_matrix_coloring(NULL), m_cols_reordered_by_color(0), m_separation_interior(INTERIOR), m_separation_exterior(OWNED), m_is_matrix_setup(false), m_is_permutation_inplace(false), m_values_permutation_vector(0), m_larger_color_offsets(0), m_smaller_color_offsets(0), m_seq_offsets(0), m_diag_end_offsets(0), allow_recompute_diag(true), block_format(ROW_MAJOR), m_resources(NULL), allow_boundary_separation(true)

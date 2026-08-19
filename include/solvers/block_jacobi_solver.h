@@ -37,6 +37,8 @@ class BlockJacobiSolver_Base : public Solver<T_Config>
 
     protected:
         double weight;
+        bool use_fused_small_blocks;
+        int bsr_spmv_backend;
         MVector Dinv;
 
         VVector t_res; // temporary storage for latency hiding case, lazy allocation

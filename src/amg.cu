@@ -288,7 +288,19 @@ class AMG_Setup
                 }
 
                 // num_rows[0] contains the total number of rows across all partitions
-                int64_t nextN = num_rows_global * level->getA().get_block_dimy();
+                int coarse_block_dimy = level->getA().get_block_dimy();
+
+                if (level->isClassicalAMGLevel())
+                {
+                    const std::string bsr_mode = amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                                                     "classical_bsr_hierarchy", amg->m_cfg_scope);
+                    coarse_block_dimy =
+                        (bsr_mode == "block_graph_identity"
+                         || bsr_mode == "block_graph_dense")
+                        ? level->getA().get_block_dimy() : 1;
+                }
+
+                int64_t nextN = num_rows_global * coarse_block_dimy;
 
                 if (!level->getA().is_matrix_distributed())
                 {
@@ -368,11 +380,11 @@ class AMG_Setup
                     // Resize coarse vectors.
                     int nextSize = level->getNextLevelSize();
                     level->getxc( ).resize( nextSize );
-                    level->getxc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getxc().set_block_dimy(nextLevel->getA().get_block_dimy());
                     level->getxc().set_block_dimx(1);
                     level->getxc().tag = nextLevel->tag * 100 + 1;
                     level->getbc( ).resize( nextSize );
-                    level->getbc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getbc().set_block_dimy(nextLevel->getA().get_block_dimy());
                     level->getbc().set_block_dimx(1);
                     level->getbc().tag = nextLevel->tag * 100 + 0;
                     int size, offset;
@@ -681,7 +693,19 @@ class AMG_Setup
                 }
 
                 // num_rows[0] contains the total number of rows across all partitions
-                int64_t nextN = num_rows_global * level->getA().get_block_dimy();
+                int coarse_block_dimy = level->getA().get_block_dimy();
+
+                if (level->isClassicalAMGLevel())
+                {
+                    const std::string bsr_mode = amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                                                     "classical_bsr_hierarchy", amg->m_cfg_scope);
+                    coarse_block_dimy =
+                        (bsr_mode == "block_graph_identity"
+                         || bsr_mode == "block_graph_dense")
+                        ? level->getA().get_block_dimy() : 1;
+                }
+
+                int64_t nextN = num_rows_global * coarse_block_dimy;
 
                 if (!level->getA().is_matrix_distributed())
                 {
@@ -735,11 +759,11 @@ class AMG_Setup
                     // Resize coarse vectors.
                     int nextSize = level->getNextLevelSize();
                     level->getxc( ).resize( nextSize );
-                    level->getxc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getxc().set_block_dimy(nextLevel->getA().get_block_dimy());
                     level->getxc().set_block_dimx(1);
                     level->getxc().tag = nextLevel->tag * 100 + 1;
                     level->getbc( ).resize( nextSize );
-                    level->getbc().set_block_dimy(level->getA( ).get_block_dimy());
+                    level->getbc().set_block_dimy(nextLevel->getA().get_block_dimy());
                     level->getbc().set_block_dimx(1);
                     level->getbc().tag = nextLevel->tag * 100 + 0;
                     int size, offset;

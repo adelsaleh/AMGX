@@ -74,6 +74,38 @@ void make_identity(Matrix &A)
     A.values.     copy(values);
 }
 
+template< typename Matrix >
+void make_block_identity(Matrix &A, int block_dim)
+{
+    typedef typename Matrix::TConfig Matrix_config;
+    typedef typename Matrix_config::template setMemSpace<AMGX_host>::Type Config_h;
+    typedef typename Config_h::template setVecPrec<AMGX_vecInt>::Type IVector_config_h;
+    typedef Vector<Config_h> FVector_h;
+    typedef Vector<IVector_config_h> IVector_h;
+    const int num_block_rows = A.get_num_rows();
+    const int block_size = block_dim * block_dim;
+    IVector_h row_offsets(num_block_rows + 1), col_indices(num_block_rows);
+    FVector_h values(num_block_rows * block_size, 0.0);
+    values.set_block_dimx(block_dim);
+    values.set_block_dimy(block_dim);
+
+    for (int block = 0; block < num_block_rows; ++block)
+    {
+        row_offsets[block] = block;
+        col_indices[block] = block;
+
+        for (int component = 0; component < block_dim; ++component)
+        {
+            values[block * block_size + component * block_dim + component] = 1.0;
+        }
+    }
+
+    row_offsets.back() = num_block_rows;
+    A.row_offsets.copy(row_offsets);
+    A.col_indices.copy(col_indices);
+    A.values.copy(values);
+}
+
 template< typename Matrix_h, typename Matrix_data >
 void csr_to_dense(const Matrix_h &A_h, Matrix_data *dense_A_h, int lda)
 {
@@ -192,6 +224,54 @@ DECLARE_UNITTEST_END(DenseLUSolverTest_Factorization_Id_32)
 
 DenseLUSolverTest_Factorization_Id_32<TemplateMode<AMGX_mode_dDDI>::Type> DenseLUSolverTest_Factorization_Id_32_dDDI;
 DenseLUSolverTest_Factorization_Id_32<TemplateMode<AMGX_mode_dFFI>::Type> DenseLUSolverTest_Factorization_Id_32_dFFI;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+DECLARE_UNITTEST_BEGIN_EXTD(DenseLUSolverTest_Factorization_Block_Id_6_7, DenseLUSolverTest_Base<T_Config>);
+
+void run()
+{
+    // A warp has 32 lanes, so 6x6 and 7x7 blocks exercise the strided
+    // BSR-to-dense conversion path for blocks with more than 32 coefficients.
+    typedef typename T_Config::template setMemSpace<AMGX_host>::Type Config_h;
+    typedef Vector<Config_h> FVector_h;
+    typedef typename TConfig::MatPrec Matrix_data;
+    const int num_block_rows = 3;
+
+    for (int block_dim = 6; block_dim <= 7; ++block_dim)
+    {
+        const int scalar_rows = num_block_rows * block_dim;
+        Matrix<T_Config> A(num_block_rows, num_block_rows, num_block_rows,
+                           block_dim, block_dim, CSR);
+        A.set_initialized(0);
+        this->make_block_identity(A, block_dim);
+        A.set_initialized(1);
+        AMG_Config cfg;
+        dense_lu_solver::DenseLUSolver<T_Config> solver(cfg, "", NULL);
+        solver.setup(A, false);
+        FVector_h dense_A(scalar_rows * scalar_rows);
+        cudaMemcpy(dense_A.raw(), solver.get_dense_A(),
+                   scalar_rows * scalar_rows * sizeof(Matrix_data),
+                   cudaMemcpyDeviceToHost);
+        cudaCheckError();
+        UNITTEST_ASSERT_EQUAL(cudaGetLastError(), cudaSuccess);
+
+        for (int i = 0; i < scalar_rows; ++i)
+        {
+            for (int j = 0; j < scalar_rows; ++j)
+            {
+                UNITTEST_ASSERT_EQUAL(
+                    dense_A[i * solver.get_lda() + j],
+                    i == j ? Matrix_data(1) : Matrix_data(0));
+            }
+        }
+    }
+}
+
+DECLARE_UNITTEST_END(DenseLUSolverTest_Factorization_Block_Id_6_7)
+
+DenseLUSolverTest_Factorization_Block_Id_6_7<TemplateMode<AMGX_mode_dDDI>::Type> DenseLUSolverTest_Factorization_Block_Id_6_7_dDDI;
+DenseLUSolverTest_Factorization_Block_Id_6_7<TemplateMode<AMGX_mode_dFFI>::Type> DenseLUSolverTest_Factorization_Block_Id_6_7_dFFI;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 

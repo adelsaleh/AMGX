@@ -79,7 +79,10 @@ class Classical_AMG_Level_Base : public AMG_Level<T_Config>
         virtual void transfer_level(AMG_Level<TConfig1> *ref_lvl);
 
         virtual void computeAOperator_1x1() = 0;
+        virtual void computeAOperator_block_graph() = 0;
         virtual void computeAOperator_1x1_distributed() = 0;
+        virtual void prepareCoarseningMatrix() = 0;
+        virtual void markScalarGuidedCoarseFinePoints() = 0;
         void prepareNextLevelMatrix(const Matrix<TConfig> &A, Matrix<TConfig> &Ac) {};
         void consolidateVector(VVector &x);
         void unconsolidateVector(VVector &x);
@@ -94,7 +97,16 @@ class Classical_AMG_Level_Base : public AMG_Level<T_Config>
         void computeRestrictionOperator();
         void computeAOperator();
         void computeAOperator_distributed();
+        bool usesBlockGraphHierarchy() const;
+        bool usesIdentityBlockGraphHierarchy() const;
+        bool usesDenseBlockGraphHierarchy() const;
+        Matrix<TConfig> &getCoarseningMatrix();
+        void releaseCoarseningMatrix();
+        void releaseBlockGraphTransfers();
         Matrix<TConfig> P, R;
+        Matrix<TConfig> *m_coarsening_A;
+        Matrix<TConfig> *m_block_graph_P;
+        Matrix<TConfig> *m_block_graph_R;
 
         Selector<TConfig> *selector;
         Interpolator<TConfig> *interpolator;
@@ -131,7 +143,10 @@ class Classical_AMG_Level< TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_ind
     public:
         Classical_AMG_Level(AMG_Class *amg) : Classical_AMG_Level_Base<TConfig_h>(amg) {}
         void computeAOperator_1x1();
+        void computeAOperator_block_graph();
         void computeAOperator_1x1_distributed();
+        void prepareCoarseningMatrix();
+        void markScalarGuidedCoarseFinePoints();
 };
 
 // specialization for device
@@ -163,7 +178,10 @@ class Classical_AMG_Level< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_i
     public:
         Classical_AMG_Level(AMG_Class *amg) : Classical_AMG_Level_Base<TConfig_d>(amg) {}
         void computeAOperator_1x1();
+        void computeAOperator_block_graph();
         void computeAOperator_1x1_distributed();
+        void prepareCoarseningMatrix();
+        void markScalarGuidedCoarseFinePoints();
 };
 
 } // namespace classical

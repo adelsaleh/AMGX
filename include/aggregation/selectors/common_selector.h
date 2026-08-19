@@ -79,20 +79,23 @@ void computeEdgeWeightsBlockDiaCsr_V2( const IndexType *row_offsets, const Index
 
         if ((i != j) && (j < num_owned)) // skip diagonal and across-boundary edges
         {
-            den = (WeightType) max(
-                      types::util<ValueType>::abs(__cachingLoad(&nonzero_values[dia_values[i] * bsize_sq + matrix_weight_entry])),
-                      types::util<ValueType>::abs(__cachingLoad(&nonzero_values[dia_values[j] * bsize_sq + matrix_weight_entry]))
-                  );
             kmin = __cachingLoad(&row_offsets[j]); //kmin = row_offsets[j];
             kmax = __cachingLoad(&row_offsets[j + 1]); //kmax = row_offsets[j+1];
             ValueType kvalue = types::util<ValueType>::get_zero();
+            int reverse_block = -1;
             bool foundk = false;
 
             for (int k = kmin; k < kmax; k++)
             {
                 if ((column_indices[k] == i) )
                 {
-                    kvalue = __cachingLoad(&nonzero_values[k * bsize_sq + matrix_weight_entry]); //kvalue = nonzero_values[k*bsize_sq+matrix_weight_entry];
+                    reverse_block = k;
+
+                    if (component >= 0)
+                    {
+                        kvalue = __cachingLoad(&nonzero_values[k * bsize_sq + matrix_weight_entry]); //kvalue = nonzero_values[k*bsize_sq+matrix_weight_entry];
+                    }
+
                     foundk = true;
                     break;
                 }
@@ -103,11 +106,55 @@ void computeEdgeWeightsBlockDiaCsr_V2( const IndexType *row_offsets, const Index
 
             if ( foundk )
             {
-                if ( weight_formula == 0 )
-                    ed_weight =  0.5 * (
-                                     types::util<ValueType>::abs(__cachingLoad(&nonzero_values[tid * bsize_sq + matrix_weight_entry])) +
-                                     types::util<ValueType>::abs(kvalue)
-                                 ) / den; // 0.5*(aij+aji)/max(a_ii,a_jj)
+                if (component == -1)
+                {
+                    // Use the complete dense block for systems whose block entries do
+                    // not represent interchangeable physical components. In
+                    // particular, HDG face blocks contain polynomial trace modes, so
+                    // selecting only one diagonal entry gives a component-dependent graph.
+                    WeightType aii_norm_sq = 0;
+                    WeightType ajj_norm_sq = 0;
+                    WeightType aij_norm_sq = 0;
+                    WeightType aji_norm_sq = 0;
+
+                    for (int entry = 0; entry < bsize_sq; entry++)
+                    {
+                        WeightType aii_abs = (WeightType) types::util<ValueType>::abs(
+                                                 __cachingLoad(&nonzero_values[dia_values[i] * bsize_sq + entry]));
+                        WeightType ajj_abs = (WeightType) types::util<ValueType>::abs(
+                                                 __cachingLoad(&nonzero_values[dia_values[j] * bsize_sq + entry]));
+                        WeightType aij_abs = (WeightType) types::util<ValueType>::abs(
+                                                 __cachingLoad(&nonzero_values[tid * bsize_sq + entry]));
+                        WeightType aji_abs = (WeightType) types::util<ValueType>::abs(
+                                                 __cachingLoad(&nonzero_values[reverse_block * bsize_sq + entry]));
+                        aii_norm_sq += aii_abs * aii_abs;
+                        ajj_norm_sq += ajj_abs * ajj_abs;
+                        aij_norm_sq += aij_abs * aij_abs;
+                        aji_norm_sq += aji_abs * aji_abs;
+                    }
+
+                    den = sqrt(max(aii_norm_sq, ajj_norm_sq));
+
+                    if (den > 0)
+                    {
+                        ed_weight = 0.5 * (sqrt(aij_norm_sq) + sqrt(aji_norm_sq)) / den;
+                    }
+                }
+                else if ( weight_formula == 0 )
+                {
+                    den = (WeightType) max(
+                              types::util<ValueType>::abs(__cachingLoad(&nonzero_values[dia_values[i] * bsize_sq + matrix_weight_entry])),
+                              types::util<ValueType>::abs(__cachingLoad(&nonzero_values[dia_values[j] * bsize_sq + matrix_weight_entry]))
+                          );
+
+                    if (den > 0)
+                    {
+                        ed_weight =  0.5 * (
+                                         types::util<ValueType>::abs(__cachingLoad(&nonzero_values[tid * bsize_sq + matrix_weight_entry])) +
+                                         types::util<ValueType>::abs(kvalue)
+                                     ) / den; // 0.5*(aij+aji)/max(a_ii,a_jj)
+                    }
+                }
                 else
                 {
                     ValueType r_z =

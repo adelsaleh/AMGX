@@ -57,36 +57,47 @@ __global__ void jacobi_l1_postsmooth_zero(
 }
 
 template<typename IndexType, typename ValueTypeA, typename ValueTypeB>
-__global__ void compute_d_kernel(const IndexType num_rows,
+__global__ void compute_d_kernel(const IndexType num_block_rows,
                                  const IndexType *Ap,
                                  const IndexType *Aj,
                                  const ValueTypeA *Ax,
+                                 const int block_dim,
+                                 const bool row_major,
                                  ValueTypeA *d)
 {
+    const IndexType num_scalar_rows = num_block_rows * block_dim;
     IndexType tidx = blockDim.x * blockIdx.x + threadIdx.x;
 
-    for (int ridx = tidx; ridx < num_rows; ridx += blockDim.x * gridDim.x)
+    for (IndexType scalar_row = tidx; scalar_row < num_scalar_rows;
+         scalar_row += blockDim.x * gridDim.x)
     {
+        const IndexType block_row = scalar_row / block_dim;
+        const IndexType local_row = scalar_row % block_dim;
         ValueTypeB d_ = 0;
-        IndexType row_start = Ap[ridx];
-        IndexType row_end   = Ap[ridx + 1];
-        // check if we need +ve or -ve d
         bool is_npd = false;
 
-        for (int j = row_start; j < row_end; j++)
+        for (IndexType block = Ap[block_row]; block < Ap[block_row + 1]; ++block)
         {
-            ValueTypeB Aij = Ax[j];
+            const IndexType block_col = Aj[block];
+            const IndexType value_begin = block * block_dim * block_dim;
 
-            if (Aj[j] == ridx && Aij < 0.) { is_npd = true; }
+            for (int local_col = 0; local_col < block_dim; ++local_col)
+            {
+                const IndexType local_value = row_major
+                                              ? local_row * block_dim + local_col
+                                              : local_col * block_dim + local_row;
+                ValueTypeB Aij = Ax[value_begin + local_value];
 
-            //if not the diagonal then compute the absolute value
-            //if(Aj[j]!=ridxa)  JE: must include diagonal here or else we can get cancellation and Nan results
-            Aij = fabs(Aij);
-            d_ += Aij;
+                if (block_col == block_row && local_col == local_row && Aij < 0.)
+                {
+                    is_npd = true;
+                }
+
+                d_ += fabs(Aij);
+            }
         }
 
-        // set sign of L1-norm appropriately
-        d[ridx] = (is_npd) ? -d_ : d_;
+        d[scalar_row] = is_npd ? -d_ : d_;
     }
 }
 
@@ -275,6 +286,7 @@ template<class T_Config>
 JacobiL1Solver_Base<T_Config>::JacobiL1Solver_Base( AMG_Config &cfg, const std::string &cfg_scope) : Solver<T_Config>( cfg, cfg_scope), m_d(0)
 {
     weight = cfg.AMG_Config::template getParameter<double>("relaxation_factor", cfg_scope);
+    scalar_rows_for_blocks = cfg.AMG_Config::template getParameter<int>("jacobi_l1_scalar_rows_for_blocks", cfg_scope) != 0;
 
     if (weight == 0)
     {
@@ -309,11 +321,17 @@ JacobiL1Solver_Base<T_Config>::solver_setup(bool reuse_matrix_structure)
 template<class T_Config>
 void JacobiL1Solver_Base<T_Config>::compute_d( Matrix<T_Config> &A)
 {
-    this->m_d.resize(A.get_num_rows()*A.get_block_size());
+    const bool scalar_matrix = A.get_block_dimx() == 1 && A.get_block_dimy() == 1;
+    const bool scalar_rows = scalar_rows_for_blocks
+                             && A.get_block_dimx() == A.get_block_dimy();
+    const int diagonal_entries_per_block_row = scalar_matrix || scalar_rows
+                                               ? A.get_block_dimy()
+                                               : A.get_block_size();
+    this->m_d.resize(A.get_num_rows() * diagonal_entries_per_block_row);
     ViewType oldView = A.currentView();
     A.setView(this->m_explicit_A->getViewExterior());
 
-    if (A.get_block_dimx() == 1 && A.get_block_dimy() == 1)
+    if (scalar_matrix || scalar_rows)
     {
         compute_d_1x1(A);
     }
@@ -323,7 +341,7 @@ void JacobiL1Solver_Base<T_Config>::compute_d( Matrix<T_Config> &A)
     }
     else
     {
-        FatalError("Unsupported block size for JacobiL1Solver", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+        FatalError("Unsupported block size for JacobiL1Solver; set jacobi_l1_scalar_rows_for_blocks=1 for square BSR matrices", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
     }
 
     A.setView(oldView);
@@ -333,22 +351,41 @@ void JacobiL1Solver_Base<T_Config>::compute_d( Matrix<T_Config> &A)
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::compute_d_1x1(const Matrix_h &A)
 {
-    //for each row
-    for (int i = 0; i < A.get_num_rows(); i++)
+    if (A.hasProps(DIAG))
     {
-        ValueTypeB d_ = 0;
+        FatalError("Scalar-row JacobiL1 does not support a separately stored block diagonal", AMGX_ERR_NOT_IMPLEMENTED);
+    }
 
-        //for each column
-        for (int j = A.row_offsets[i]; j < A.row_offsets[i + 1]; j++)
+    const int block_dim = A.get_block_dimy();
+    const bool row_major = A.getBlockFormat() == ROW_MAJOR;
+
+    for (int block_row = 0; block_row < A.get_num_rows(); ++block_row)
+    {
+        for (int local_row = 0; local_row < block_dim; ++local_row)
         {
-            ValueTypeB Aij = A.values[j];
-            //if not the diagonal then compute the absolute value
-            //if(A.col_indices[j]!=i) JE have to include diagonal or risk cancellation if diagonal is negative
-            Aij = fabs(Aij);
-            d_ += Aij;
-        }
+            ValueTypeB d_ = 0;
+            bool is_npd = false;
 
-        this->m_d[i] = d_;
+            for (int block = A.row_offsets[block_row]; block < A.row_offsets[block_row + 1]; ++block)
+            {
+                for (int local_col = 0; local_col < block_dim; ++local_col)
+                {
+                    const int local_value = row_major
+                                            ? local_row * block_dim + local_col
+                                            : local_col * block_dim + local_row;
+                    ValueTypeB Aij = A.values[block * block_dim * block_dim + local_value];
+
+                    if (A.col_indices[block] == block_row && local_col == local_row && Aij < 0.)
+                    {
+                        is_npd = true;
+                    }
+
+                    d_ += fabs(Aij);
+                }
+            }
+
+            this->m_d[block_row * block_dim + local_row] = is_npd ? -d_ : d_;
+        }
     }
 }
 
@@ -363,26 +400,28 @@ void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void JacobiL1Solver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::compute_d_1x1(const Matrix_d &A)
 {
-//DIAG: starnge issues trying to add DIAG property handling
-// now leaving !DIAG only
     if (A.hasProps(DIAG))
     {
-        FatalError("Unsupported separate diag", AMGX_ERR_NOT_IMPLEMENTED);
+        FatalError("Scalar-row JacobiL1 does not support a separately stored block diagonal", AMGX_ERR_NOT_IMPLEMENTED);
     }
 
     typedef typename Matrix_d::index_type IndexType;
     typedef typename Matrix_d::value_type ValueTypeA;
-    const size_t THREADS_PER_BLOCK  = 128;
-    const size_t NUM_BLOCKS = std::min(AMGX_GRID_MAX_SIZE, (int)ceil((ValueTypeB)A.get_num_rows() / (ValueTypeB)THREADS_PER_BLOCK));
+    const int threads_per_block = 128;
+    const int scalar_rows = A.get_num_rows() * A.get_block_dimy();
+    const int num_blocks = std::min(AMGX_GRID_MAX_SIZE,
+                                    (scalar_rows + threads_per_block - 1) / threads_per_block);
 
-    if (A.get_num_rows() > 0)
+    if (scalar_rows > 0)
     {
-        compute_d_kernel<IndexType, ValueTypeA, ValueTypeB> <<< (unsigned int)NUM_BLOCKS, (unsigned int)THREADS_PER_BLOCK>>>
-        ((int)A.get_num_rows(),
-         A.row_offsets.raw(),
-         A.col_indices.raw(),
-         A.values.raw(),
-         this->m_d.raw());
+        compute_d_kernel<IndexType, ValueTypeA, ValueTypeB>
+        <<<num_blocks, threads_per_block>>>(A.get_num_rows(),
+                                            A.row_offsets.raw(),
+                                            A.col_indices.raw(),
+                                            A.values.raw(),
+                                            A.get_block_dimy(),
+                                            A.getBlockFormat() == ROW_MAJOR,
+                                            this->m_d.raw());
     }
 
     cudaCheckError();
@@ -429,7 +468,12 @@ JacobiL1Solver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIs
     ViewType oldView = this->m_explicit_A->currentView();
     this->m_explicit_A->setViewExterior();
 
-    if (this->m_explicit_A->get_block_dimx() == 1 && this->m_explicit_A->get_block_dimy() == 1)
+    const bool scalar_matrix = this->m_explicit_A->get_block_dimx() == 1
+                               && this->m_explicit_A->get_block_dimy() == 1;
+    const bool scalar_rows = scalar_rows_for_blocks
+                             && this->m_explicit_A->get_block_dimx() == this->m_explicit_A->get_block_dimy();
+
+    if (scalar_matrix || scalar_rows)
     {
         if (xIsZero)
         {
@@ -440,9 +484,14 @@ JacobiL1Solver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIs
             smooth_1x1(*this->m_explicit_A, b, x, this->m_explicit_A->getViewExterior(), false);
         }
     }
+    else if (this->m_explicit_A->get_block_dimx() == 4
+             && this->m_explicit_A->get_block_dimy() == 4)
+    {
+        smooth_4x4(*this->m_explicit_A, b, x, this->m_explicit_A->getViewExterior());
+    }
     else
     {
-        FatalError("Unsupported block size for JacobiL1_Solver", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+        FatalError("Unsupported block size for JacobiL1Solver; set jacobi_l1_scalar_rows_for_blocks=1 for square BSR matrices", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
     }
 
     x.dirtybit = 1;
@@ -462,20 +511,35 @@ template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrec
 void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_1x1(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags, bool latency_hiding)
 {
     VVector newx((int)x.size());
+    const int block_dim = A.get_block_dimy();
+    const bool row_major = A.getBlockFormat() == ROW_MAJOR;
 
-    //for each row
-    for (int i = 0; i < A.get_num_rows(); i++)
+    for (int block_row = 0; block_row < A.get_num_rows(); ++block_row)
     {
-        ValueTypeB Axi = 0.0;
-
-        //for each column
-        for (int j = A.row_offsets[i]; j < A.row_offsets[i + 1]; j++)
+        for (int local_row = 0; local_row < block_dim; ++local_row)
         {
-            Axi += A.values[j] * x[A.col_indices[j]];
-        }
+            const int scalar_row = block_row * block_dim + local_row;
+            ValueTypeB Axi = 0.0;
 
-        ValueTypeA d = this->m_d[i];
-        newx[i] = x[i] + (b[i] - Axi) /  ( isNotCloseToZero( d) ? d : epsilon(d) );
+            for (int block = A.row_offsets[block_row]; block < A.row_offsets[block_row + 1]; ++block)
+            {
+                const int scalar_col_begin = A.col_indices[block] * block_dim;
+
+                for (int local_col = 0; local_col < block_dim; ++local_col)
+                {
+                    const int local_value = row_major
+                                            ? local_row * block_dim + local_col
+                                            : local_col * block_dim + local_row;
+                    Axi += A.values[block * block_dim * block_dim + local_value]
+                           * x[scalar_col_begin + local_col];
+                }
+            }
+
+            ValueTypeA d = this->m_d[scalar_row];
+            newx[scalar_row] = x[scalar_row]
+                               + (b[scalar_row] - Axi)
+                               / (isNotCloseToZero(d) ? d : epsilon(d));
+        }
     }
 
     x.swap(newx);
@@ -491,11 +555,12 @@ void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void JacobiL1Solver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_with_0_initial_guess_1x1(Matrix_h &A, VVector &b, VVector &x, ViewType separation_flags)
 {
-    //for each row
-    for (int i = 0; i < A.get_num_rows(); i++)
+    const int scalar_rows = A.get_num_rows() * A.get_block_dimy();
+
+    for (int i = 0; i < scalar_rows; ++i)
     {
         ValueTypeA d = this->m_d[i];
-        x[i] = b[i] / ( isNotCloseToZero( d) ? d : epsilon(d) );
+        x[i] = b[i] / (isNotCloseToZero(d) ? d : epsilon(d));
     }
 }
 
@@ -510,10 +575,17 @@ void JacobiL1Solver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec>
     int offset, num_rows;
     A.getOffsetAndSizeForView(A.getViewExterior(), &offset, &num_rows);
 
-    int nthreads_per_block = 128;
-    int n = num_rows - offset;
-    int nblocks = n / nthreads_per_block + 1;
-    jacobi_l1_postsmooth<<<nblocks, nthreads_per_block>>>(n, this->weight, x.raw() + offset, this->m_d.raw() + offset, b.raw() + offset, this->y_tmp.raw() + offset);
+    const int scalar_offset = offset * A.get_block_dimy();
+    const int n = (num_rows - offset) * A.get_block_dimy();
+    const int threads_per_block = 128;
+    const int num_blocks = (n + threads_per_block - 1) / threads_per_block;
+
+    if (n > 0)
+    {
+        jacobi_l1_postsmooth<<<num_blocks, threads_per_block>>>(n, this->weight,
+                x.raw() + scalar_offset, this->m_d.raw() + scalar_offset,
+                b.raw() + scalar_offset, this->y_tmp.raw() + scalar_offset);
+    }
 
     cudaCheckError();
 }
@@ -576,10 +648,18 @@ void JacobiL1Solver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec>
     int offset, num_rows;
     A.getOffsetAndSizeForView(A.getViewExterior(), &offset, &num_rows);
 
-    int nthreads_per_block = 128;
-    int n = num_rows - offset;
-    int nblocks = n / nthreads_per_block + 1;
-    jacobi_l1_postsmooth_zero<<<nblocks, nthreads_per_block>>>(n, this->weight, x.raw() + offset, this->m_d.raw() + offset, b.raw() + offset);
+    const int scalar_offset = offset * A.get_block_dimy();
+    const int n = (num_rows - offset) * A.get_block_dimy();
+    const int threads_per_block = 128;
+    const int num_blocks = (n + threads_per_block - 1) / threads_per_block;
+
+    if (n > 0)
+    {
+        jacobi_l1_postsmooth_zero<<<num_blocks, threads_per_block>>>(n, this->weight,
+                x.raw() + scalar_offset, this->m_d.raw() + scalar_offset,
+                b.raw() + scalar_offset);
+    }
+
     cudaCheckError();
 
     A.setView(oldView);

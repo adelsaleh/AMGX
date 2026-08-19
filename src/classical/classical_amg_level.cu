@@ -5,6 +5,7 @@
 #define COARSE_CLA_CONSO 0
 
 #include <classical/classical_amg_level.h>
+#include <classical/block_graph.h>
 #include <amg_level.h>
 
 #include <basic_types.h>
@@ -22,6 +23,8 @@
 #include <thrust/extrema.h> // for minmax_element
 
 #include <algorithm>
+#include <limits>
+#include <string>
 #include <assert.h>
 #include <matrix_io.h>
 
@@ -47,7 +50,169 @@ struct is_zero
     }
 };
 
+inline int block_spmv_backend_id(const std::string &backend)
+{
+    return backend == "cusparse_generic" ? 1
+           : backend == "custom_5x5" ? 2 : 0;
+}
+
+template <class TConfig>
+void set_block_spmv_backend(Matrix<TConfig> &matrix, int backend)
+{
+    matrix.setParameter("bsr_spmv_backend", backend);
+    matrix.setParameter("use_subgroup_5x5_spmv", int(backend == 2));
+}
+
 #define AMGX_CAL_BLOCK_SIZE 256
+
+template <typename IndexType>
+__global__ void expand_bsr_row_offsets_kernel(const IndexType *block_row_offsets,
+        IndexType num_block_rows, int block_dim, IndexType *scalar_row_offsets,
+        IndexType *scalar_sequence)
+{
+    const IndexType num_scalar_rows = num_block_rows * block_dim;
+
+    for (IndexType scalar_row = threadIdx.x + blockIdx.x * blockDim.x;
+         scalar_row <= num_scalar_rows;
+         scalar_row += blockDim.x * gridDim.x)
+    {
+        scalar_sequence[scalar_row] = scalar_row;
+
+        if (scalar_row == num_scalar_rows)
+        {
+            scalar_row_offsets[scalar_row] = block_row_offsets[num_block_rows] * block_dim * block_dim;
+        }
+        else
+        {
+            const IndexType block_row = scalar_row / block_dim;
+            const IndexType local_row = scalar_row % block_dim;
+            const IndexType row_blocks = block_row_offsets[block_row + 1] - block_row_offsets[block_row];
+            scalar_row_offsets[scalar_row] = block_row_offsets[block_row] * block_dim * block_dim
+                                             + local_row * row_blocks * block_dim;
+        }
+    }
+}
+
+template <typename IndexType, typename ValueType>
+__global__ void expand_bsr_values_kernel(const IndexType *block_row_offsets,
+        const IndexType *block_col_indices, const ValueType *block_values,
+        IndexType num_block_rows, int block_dim, bool row_major,
+        const IndexType *scalar_row_offsets,
+        IndexType *scalar_col_indices, ValueType *scalar_values)
+{
+    const IndexType num_scalar_rows = num_block_rows * block_dim;
+
+    for (IndexType scalar_row = threadIdx.x + blockIdx.x * blockDim.x;
+         scalar_row < num_scalar_rows;
+         scalar_row += blockDim.x * gridDim.x)
+    {
+        const IndexType block_row = scalar_row / block_dim;
+        const IndexType local_row = scalar_row % block_dim;
+        const IndexType block_begin = block_row_offsets[block_row];
+        const IndexType block_end = block_row_offsets[block_row + 1];
+        IndexType output = scalar_row_offsets[scalar_row];
+
+        for (IndexType block = block_begin; block < block_end; ++block)
+        {
+            const IndexType scalar_col_begin = block_col_indices[block] * block_dim;
+            const IndexType value_begin = block * block_dim * block_dim;
+
+            for (int local_col = 0; local_col < block_dim; ++local_col, ++output)
+            {
+                scalar_col_indices[output] = scalar_col_begin + local_col;
+                const IndexType local_value = row_major
+                                              ? local_row * block_dim + local_col
+                                              : local_col * block_dim + local_row;
+                scalar_values[output] = block_values[value_begin + local_value];
+            }
+        }
+    }
+}
+
+template <class TConfig>
+void expand_bsr_to_scalar_matrix(const Matrix<TConfig> &A,
+                                 Matrix<TConfig> &scalar_A)
+{
+    typedef typename Matrix<TConfig>::index_type IndexType;
+    const IndexType block_dim = A.get_block_dimx();
+    const int64_t scalar_rows_64 =
+        static_cast<int64_t>(A.get_num_rows()) * block_dim;
+    const int64_t scalar_cols_64 =
+        static_cast<int64_t>(A.get_num_cols()) * block_dim;
+    const int64_t scalar_nnz_64 =
+        static_cast<int64_t>(A.get_num_nz()) * block_dim * block_dim;
+
+    if (scalar_rows_64 > std::numeric_limits<IndexType>::max()
+            || scalar_cols_64 > std::numeric_limits<IndexType>::max()
+            || scalar_nnz_64 > std::numeric_limits<IndexType>::max())
+    {
+        FatalError("Classical BSR scalar expansion exceeds the configured index precision",
+                   AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    const IndexType scalar_rows = static_cast<IndexType>(scalar_rows_64);
+    const IndexType scalar_cols = static_cast<IndexType>(scalar_cols_64);
+    const IndexType scalar_nnz = static_cast<IndexType>(scalar_nnz_64);
+    scalar_A.set_initialized(0);
+    scalar_A.addProps(CSR);
+    scalar_A.setResources(A.getResources());
+    // Allocate explicitly instead of Matrix::resize(): large device-side
+    // thrust::sequence calls in resize are not reliable with CUDA 13 on
+    // pre-Ampere GPUs. The kernels initialize both CSR metadata arrays.
+    scalar_A.set_num_rows(scalar_rows);
+    scalar_A.set_num_cols(scalar_cols);
+    scalar_A.set_num_nz(scalar_nnz);
+    scalar_A.set_block_dimx(1);
+    scalar_A.set_block_dimy(1);
+    scalar_A.row_offsets.resize(scalar_rows + 1);
+    scalar_A.col_indices.resize(scalar_nnz);
+    scalar_A.values.resize(scalar_nnz + 1);
+    scalar_A.diag.resize(scalar_rows);
+    scalar_A.m_diag_end_offsets.resize(scalar_rows);
+    scalar_A.m_seq_offsets.resize(scalar_rows + 1);
+
+    if (scalar_rows > 0)
+    {
+        const int threads = 256;
+        const int blocks = std::min(
+            AMGX_GRID_MAX_SIZE,
+            static_cast<int>((scalar_rows_64 + threads - 1) / threads));
+        expand_bsr_row_offsets_kernel<<<blocks, threads>>>(
+            A.row_offsets.raw(), A.get_num_rows(), block_dim,
+            scalar_A.row_offsets.raw(), scalar_A.m_seq_offsets.raw());
+        cudaCheckError();
+        expand_bsr_values_kernel<<<blocks, threads>>>(
+            A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(),
+            A.get_num_rows(), block_dim, A.getBlockFormat() == ROW_MAJOR,
+            scalar_A.row_offsets.raw(), scalar_A.col_indices.raw(),
+            scalar_A.values.raw());
+        cudaCheckError();
+    }
+
+    scalar_A.computeDiagonal();
+    scalar_A.set_initialized(1);
+}
+
+__global__ void collapse_scalar_cf_to_block_any_kernel(
+    const int *scalar_cf_map, int num_block_rows, int block_dim,
+    int *block_cf_map)
+{
+    for (int block_row = threadIdx.x + blockIdx.x * blockDim.x;
+         block_row < num_block_rows;
+         block_row += blockDim.x * gridDim.x)
+    {
+        bool any_coarse = false;
+        const int scalar_begin = block_row * block_dim;
+
+        for (int component = 0; component < block_dim; ++component)
+        {
+            any_coarse = any_coarse
+                         || scalar_cf_map[scalar_begin + component] == COARSE;
+        }
+
+        block_cf_map[block_row] = any_coarse ? COARSE : FINE;
+    }
+}
 
 /* There might be a situation where not all local_to_global_map columns are present in the matrix (because some rows were removed
    and the columns in these rows are therefore no longer present. This kernel creates the flags array that marks existing columns. */
@@ -178,6 +343,105 @@ Interpolator<T_Config> *chooseAggressiveInterpolator(AMG_Config *m_cfg, std::str
 template <class T_Config>
 Classical_AMG_Level_Base<T_Config>::Classical_AMG_Level_Base(AMG_Class *amg) : AMG_Level<T_Config>(amg)
 {
+    m_coarsening_A = NULL;
+    m_block_graph_P = NULL;
+    m_block_graph_R = NULL;
+    const std::string bsr_mode = amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                                     "classical_bsr_hierarchy", amg->m_cfg_scope);
+
+    if (bsr_mode != "scalar_expand"
+            && bsr_mode != "block_graph_identity"
+            && bsr_mode != "block_graph_dense")
+    {
+        FatalError(
+            "classical_bsr_hierarchy must be scalar_expand, "
+            "block_graph_identity, or block_graph_dense",
+            AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    if (bsr_mode == "block_graph_identity"
+            || bsr_mode == "block_graph_dense")
+    {
+        const std::string coarse_selector =
+            amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "block_graph_coarse_selector", amg->m_cfg_scope);
+
+        if (coarse_selector != "block_graph"
+                && coarse_selector != "scalar_guided_any")
+        {
+            FatalError("Invalid block_graph_coarse_selector",
+                       AMGX_ERR_BAD_PARAMETERS);
+        }
+
+        const std::string strength_metric =
+            amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "block_graph_strength_metric", amg->m_cfg_scope);
+
+        if (strength_metric != "frobenius"
+                && strength_metric != "diagonal_normalized_frobenius"
+                && strength_metric != "symmetric_inverse_diagonal_frobenius")
+        {
+            FatalError("Invalid block_graph_strength_metric",
+                       AMGX_ERR_BAD_PARAMETERS);
+        }
+    }
+
+    if (bsr_mode == "block_graph_dense")
+    {
+        const std::string interpolation_mode =
+            amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "block_graph_dense_interpolation_mode", amg->m_cfg_scope);
+        const double smoothing_weight =
+            amg->m_cfg->AMG_Config::template getParameter<double>(
+                "block_graph_dense_smoothing_weight", amg->m_cfg_scope);
+        const int smoothing_steps =
+            amg->m_cfg->AMG_Config::template getParameter<int>(
+                "block_graph_dense_smoothing_steps", amg->m_cfg_scope);
+        const std::string constraint_mode =
+            amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "block_graph_dense_constraint_mode", amg->m_cfg_scope);
+        const double pivot_tolerance =
+            amg->m_cfg->AMG_Config::template getParameter<double>(
+                "block_graph_dense_pivot_tolerance", amg->m_cfg_scope);
+        const double constraint_tolerance =
+            amg->m_cfg->AMG_Config::template getParameter<double>(
+                "block_graph_dense_constraint_tolerance", amg->m_cfg_scope);
+        const int structure_reuse_levels =
+            amg->m_cfg->AMG_Config::template getParameter<int>(
+                "structure_reuse_levels", amg->m_cfg_scope);
+        const int aggressive_levels =
+            amg->m_cfg->AMG_Config::template getParameter<int>(
+                "aggressive_levels", amg->m_cfg_scope);
+
+        if (structure_reuse_levels != 0)
+        {
+            FatalError(
+                "block_graph_dense requires structure_reuse_levels=0",
+                AMGX_ERR_NOT_IMPLEMENTED);
+        }
+
+        if (aggressive_levels != 0)
+        {
+            FatalError(
+                "block_graph_dense currently requires aggressive_levels=0; "
+                "aggressive D2 can leave fine block rows without interpolation support",
+                AMGX_ERR_NOT_IMPLEMENTED);
+        }
+
+        if ((interpolation_mode != "jacobi"
+                    && interpolation_mode != "extended_i")
+                || !(smoothing_weight > 0.0) || !(smoothing_weight <= 2.0)
+                || smoothing_steps < 1 || smoothing_steps > 8
+                || (constraint_mode != "additive"
+                    && constraint_mode != "right_normalize")
+                || !(pivot_tolerance > 0.0)
+                || !(constraint_tolerance > 0.0))
+        {
+            FatalError("Invalid block_graph_dense interpolation parameters",
+                       AMGX_ERR_BAD_PARAMETERS);
+        }
+    }
+
     strength = StrengthFactory<T_Config>::allocate(*(amg->m_cfg), amg->m_cfg_scope);
     selector = classical::SelectorFactory<T_Config>::allocate(*(amg->m_cfg), amg->m_cfg_scope);
     interpolator = InterpolatorFactory<T_Config>::allocate(*(amg->m_cfg), amg->m_cfg_scope);
@@ -190,9 +454,58 @@ Classical_AMG_Level_Base<T_Config>::Classical_AMG_Level_Base(AMG_Class *amg) : A
 template <class T_Config>
 Classical_AMG_Level_Base<T_Config>::~Classical_AMG_Level_Base()
 {
+    releaseCoarseningMatrix();
+    releaseBlockGraphTransfers();
     delete strength;
     delete selector;
     delete interpolator;
+}
+template <class T_Config>
+bool Classical_AMG_Level_Base<T_Config>::usesBlockGraphHierarchy() const
+{
+    return (usesIdentityBlockGraphHierarchy()
+            || usesDenseBlockGraphHierarchy())
+           && this->A->get_block_size() > 1;
+}
+
+template <class T_Config>
+bool Classical_AMG_Level_Base<T_Config>::usesIdentityBlockGraphHierarchy() const
+{
+    const std::string mode =
+        this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+            "classical_bsr_hierarchy", this->amg->m_cfg_scope);
+    return mode == "block_graph_identity";
+}
+
+template <class T_Config>
+bool Classical_AMG_Level_Base<T_Config>::usesDenseBlockGraphHierarchy() const
+{
+    const std::string mode =
+        this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+            "classical_bsr_hierarchy", this->amg->m_cfg_scope);
+    return mode == "block_graph_dense";
+}
+
+template <class T_Config>
+Matrix<T_Config> &Classical_AMG_Level_Base<T_Config>::getCoarseningMatrix()
+{
+    return m_coarsening_A == NULL ? this->getA() : *m_coarsening_A;
+}
+
+template <class T_Config>
+void Classical_AMG_Level_Base<T_Config>::releaseCoarseningMatrix()
+{
+    delete m_coarsening_A;
+    m_coarsening_A = NULL;
+}
+
+template <class T_Config>
+void Classical_AMG_Level_Base<T_Config>::releaseBlockGraphTransfers()
+{
+    delete m_block_graph_P;
+    delete m_block_graph_R;
+    m_block_graph_P = NULL;
+    m_block_graph_R = NULL;
 }
 
 template <class T_Config>
@@ -212,6 +525,7 @@ void Classical_AMG_Level_Base<T_Config>::transfer_level(AMG_Level<TConfig1> *ref
 template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::createCoarseVertices()
 {
+    prepareCoarseningMatrix();
     if (AMG_Level<T_Config>::getLevelIndex() < this->num_aggressive_levels)
     {
         if (selector) { delete selector; }
@@ -220,7 +534,7 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseVertices()
     }
 
     Matrix<T_Config> &RAP = this->getNextLevel( typename Matrix<T_Config>::memory_space( ) )->getA( );
-    Matrix<T_Config> &A = this->getA();
+    Matrix<T_Config> &A = getCoarseningMatrix();
     int size_all, size_full, nnz_full;
 
     if (!A.is_matrix_singleGPU())
@@ -248,11 +562,37 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseVertices()
     thrust_wrapper::fill<T_Config::memSpace>(this->m_scratch.begin(), this->m_scratch.end(), 0);
     cudaCheckError();
     markCoarseFinePoints();
+    // The hierarchy driver can reject this coarse level after selection. Do
+    // not retain a temporary scalar expansion or block graph in that case.
+    releaseCoarseningMatrix();
 }
 
 template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::createCoarseMatrices()
 {
+    // Recreate the temporary scalar operator for interpolation and RAP. This
+    // also covers hierarchy-structure reuse, where createCoarseVertices is
+    // intentionally skipped by the driver.
+    prepareCoarseningMatrix();
+    const bool block_graph_hierarchy = usesBlockGraphHierarchy();
+
+    if (block_graph_hierarchy)
+    {
+        releaseBlockGraphTransfers();
+        const bool aggressive = AMG_Level<T_Config>::getLevelIndex() < this->num_aggressive_levels;
+        const std::string interpolation = this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                                              aggressive ? "aggressive_interpolator" : "interpolator",
+                                              this->amg->m_cfg_scope);
+
+        if (interpolation != "D2")
+        {
+            FatalError(
+                "Block-graph classical BSR hierarchies require D2 "
+                "interpolation on every level",
+                AMGX_ERR_NOT_IMPLEMENTED);
+        }
+    }
+
     // allocate aggressive interpolator if needed
     if (AMG_Level<T_Config>::getLevelIndex() < this->num_aggressive_levels)
     {
@@ -262,7 +602,7 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseMatrices()
     }
 
     Matrix<T_Config> &RAP = this->getNextLevel( typename Matrix<T_Config>::memory_space( ) )->getA( );
-    Matrix<T_Config> &A = this->getA();
+    Matrix<T_Config> &A = getCoarseningMatrix();
     /* WARNING: exit if D1 interpolator is selected in distributed setting */
     std::string s("");
     s += AMG_Level<T_Config>::amg->m_cfg->AMG_Config::template getParameter<std::string>("interpolator", AMG_Level<T_Config>::amg->m_cfg_scope);
@@ -287,6 +627,23 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseMatrices()
         {
             computeRestrictionOperator();
         }
+        else if (block_graph_hierarchy)
+        {
+            if (usesDenseBlockGraphHierarchy())
+            {
+                FatalError(
+                    "block_graph_dense does not yet support hierarchy "
+                    "structure reuse",
+                    AMGX_ERR_NOT_IMPLEMENTED);
+            }
+
+            m_block_graph_P = new Matrix<TConfig>();
+            m_block_graph_R = new Matrix<TConfig>();
+            Block_Graph_Ops<TConfig>::extract_scalar_transfer(
+                P, *m_block_graph_P);
+            Block_Graph_Ops<TConfig>::extract_scalar_transfer(
+                R, *m_block_graph_R);
+        }
 
         computeAOperator();
     }
@@ -295,6 +652,25 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseMatrices()
         /* WARNING: notice that in this case the computeRestructionOperator() is called
                     inside computeAOperator_distributed() routine. */
         computeAOperator_distributed();
+    }
+
+    // The weighted block Galerkin kernel consumes the scalar P/R shadows
+    // asynchronously.  Complete this level's setup before constructing later
+    // levels that may reuse the device pool.
+    if (block_graph_hierarchy)
+    {
+        cudaDeviceSynchronize();
+        cudaCheckError();
+    }
+
+    // Keep the small scalar transfer shadows alive with a pure-BSR level.
+    // Retained V-cycle operators are still the lifted BSR P/R matrices; the
+    // shadows are only setup data, but releasing them here invalidates storage
+    // still referenced by the lifted transfer structure in the current AMGX
+    // device-vector ownership path.  The level destructor releases them.
+    if (!block_graph_hierarchy)
+    {
+        releaseBlockGraphTransfers();
     }
 
 // we also need to renumber columns of P and rows or R correspondingly since we changed RAP halo columns
@@ -321,7 +697,7 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseMatrices()
         P.set_initialized(1);
     }
 
-    RAP.copyAuxData(&A);
+    RAP.copyAuxData(block_graph_hierarchy ? &this->getA() : &A);
 
     if (!A.is_matrix_singleGPU() && RAP.manager == NULL)
     {
@@ -339,12 +715,26 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseMatrices()
         this->getNextLevel(typename Matrix<TConfig>::memory_space())->getA().getOffsetAndSizeForView(FULL, &offset, &size);
         this->m_next_level_size = size * this->getNextLevel(typename Matrix<TConfig>::memory_space() )->getA().get_block_dimy();
     }
+    releaseCoarseningMatrix();
 }
 
 template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::markCoarseFinePoints()
 {
-    Matrix<T_Config> &A = this->getA();
+    if (usesBlockGraphHierarchy())
+    {
+        const std::string coarse_selector =
+            this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "block_graph_coarse_selector", this->amg->m_cfg_scope);
+
+        if (coarse_selector == "scalar_guided_any")
+        {
+            markScalarGuidedCoarseFinePoints();
+            return;
+        }
+    }
+
+    Matrix<T_Config> &A = getCoarseningMatrix();
     //allocate necessary memory
     typedef Vector<typename TConfig::template setVecPrec<AMGX_vecInt>::Type> IVector;
     typedef Vector<typename TConfig::template setVecPrec<AMGX_vecBool>::Type> BVector;
@@ -406,25 +796,91 @@ template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::computeProlongationOperator()
 {
     this->Profile.tic("computeP");
-    Matrix<T_Config> &A = this->getA();
-    //allocate necessary memory
-    typedef Vector<typename TConfig::template setVecPrec<AMGX_vecInt>::Type> IVector;
-    typedef Vector<typename TConfig::template setVecPrec<AMGX_vecBool>::Type> BVector;
-    typedef Vector<typename TConfig::template setVecPrec<AMGX_vecFloat>::Type> FVector;
-    //generate the interpolation matrix
-    interpolator->generateInterpolationMatrix(A, this->m_cf_map, this->m_s_con, this->m_scratch, P);
+    Matrix<T_Config> &A = getCoarseningMatrix();
+    const bool block_graph_hierarchy = usesBlockGraphHierarchy();
+    Matrix<TConfig> *generated_P = &P;
+
+    if (block_graph_hierarchy)
+    {
+        m_block_graph_P = new Matrix<TConfig>();
+        generated_P = m_block_graph_P;
+    }
+
+    interpolator->generateInterpolationMatrix(A, this->m_cf_map, this->m_s_con,
+                                               this->m_scratch, *generated_P);
+
+    // Truncate the scalar D2 support before either identity lifting or dense
+    // block smoothing. Both pure-BSR modes retain this fixed block graph.
+    if (this->max_elmts > 0 && generated_P->get_num_rows() > 0)
+    {
+        Truncate<TConfig>::truncateByMaxElements(*generated_P, this->max_elmts);
+    }
+
+    if (block_graph_hierarchy)
+    {
+        Matrix<TConfig> &block_A = this->getA();
+        const std::string backend =
+            this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "bsr_spmv_backend", this->amg->m_cfg_scope);
+        const int backend_id = block_spmv_backend_id(backend);
+        BlockFormat block_format = block_A.getBlockFormat();
+
+        if (usesDenseBlockGraphHierarchy())
+        {
+            const std::string interpolation_mode =
+                this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                    "block_graph_dense_interpolation_mode",
+                    this->amg->m_cfg_scope);
+            const double smoothing_weight =
+                this->amg->m_cfg->AMG_Config::template getParameter<double>(
+                    "block_graph_dense_smoothing_weight",
+                    this->amg->m_cfg_scope);
+            const int smoothing_steps =
+                this->amg->m_cfg->AMG_Config::template getParameter<int>(
+                    "block_graph_dense_smoothing_steps",
+                    this->amg->m_cfg_scope);
+            const std::string constraint_mode =
+                this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                    "block_graph_dense_constraint_mode",
+                    this->amg->m_cfg_scope);
+            const double pivot_tolerance =
+                this->amg->m_cfg->AMG_Config::template getParameter<double>(
+                    "block_graph_dense_pivot_tolerance",
+                    this->amg->m_cfg_scope);
+            const double constraint_tolerance =
+                this->amg->m_cfg->AMG_Config::template getParameter<double>(
+                    "block_graph_dense_constraint_tolerance",
+                    this->amg->m_cfg_scope);
+            if (interpolation_mode == "extended_i")
+            {
+                Block_Graph_Ops<TConfig>::extended_i_dense_transfer(
+                    block_A, *generated_P, this->m_cf_map, this->m_s_con,
+                    pivot_tolerance, constraint_tolerance, P);
+            }
+            else
+            {
+                Block_Graph_Ops<TConfig>::smooth_dense_transfer(
+                    block_A, *generated_P, smoothing_weight, smoothing_steps,
+                    constraint_mode == "right_normalize", pivot_tolerance,
+                    constraint_tolerance, P);
+            }
+        }
+        else
+        {
+            Block_Graph_Ops<TConfig>::lift_scalar_transfer(
+                *generated_P, block_A.get_block_dimx(), block_format, P);
+        }
+
+        set_block_spmv_backend(block_A, backend_id);
+        set_block_spmv_backend(P, backend_id);
+    }
+
     this->m_cf_map.clear();
     this->m_cf_map.shrink_to_fit();
     this->m_scratch.clear();
     this->m_scratch.shrink_to_fit();
     this->m_s_con.clear();
     this->m_s_con.shrink_to_fit();
-
-    // truncate based on max # of elements if desired
-    if (this->max_elmts > 0 && P.get_num_rows() > 0)
-    {
-        Truncate<TConfig>::truncateByMaxElements(P, this->max_elmts);
-    }
 
     if (!P.isLatencyHidingEnabled(*this->amg->m_cfg))
     {
@@ -441,9 +897,50 @@ template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::computeRestrictionOperator()
 {
     this->Profile.tic("computeR");
-    R.set_initialized(0);
-    P.setView(OWNED);
-    transpose(P, R, P.get_num_rows());
+    const bool block_graph_hierarchy = usesBlockGraphHierarchy();
+    Matrix<TConfig> *source_P = &P;
+    Matrix<TConfig> *generated_R = &R;
+
+    if (block_graph_hierarchy)
+    {
+        if (m_block_graph_P == NULL)
+        {
+            FatalError("Missing scalar block-graph prolongation", AMGX_ERR_INTERNAL);
+        }
+
+        m_block_graph_R = new Matrix<TConfig>();
+        source_P = m_block_graph_P;
+        generated_R = m_block_graph_R;
+    }
+
+    generated_R->set_initialized(0);
+    source_P->setView(OWNED);
+    transpose(*source_P, *generated_R, source_P->get_num_rows());
+    generated_R->set_initialized(1);
+
+    if (block_graph_hierarchy)
+    {
+        Matrix<TConfig> &block_A = this->getA();
+        const std::string backend =
+            this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "bsr_spmv_backend", this->amg->m_cfg_scope);
+        const int backend_id = block_spmv_backend_id(backend);
+        BlockFormat block_format = block_A.getBlockFormat();
+
+        if (usesDenseBlockGraphHierarchy())
+        {
+            Block_Graph_Ops<TConfig>::transpose_dense_transfer(
+                *generated_R, P, R);
+        }
+        else
+        {
+            Block_Graph_Ops<TConfig>::lift_scalar_transfer(
+                *generated_R, block_A.get_block_dimx(), block_format, R);
+        }
+
+        set_block_spmv_backend(block_A, backend_id);
+        set_block_spmv_backend(R, backend_id);
+    }
 
     if (!R.isLatencyHidingEnabled(*this->amg->m_cfg))
     {
@@ -460,7 +957,9 @@ void Classical_AMG_Level_Base<T_Config>::computeRestrictionOperator()
         int nrows_full = P.manager->halo_offsets[P.manager->neighbors.size()];
         int nz_full = R.row_offsets[nrows_full];
         int nz_owned = R.row_offsets[nrows_owned];
-        R.manager->setViewSizes(nrows_owned, nz_owned, nrows_owned, nz_owned, nrows_full, nz_full, R.get_num_rows(), R.get_num_nz());
+        R.manager->setViewSizes(nrows_owned, nz_owned, nrows_owned, nz_owned,
+                                nrows_full, nz_full, R.get_num_rows(),
+                                R.get_num_nz());
     }
 
     R.set_initialized(1);
@@ -472,23 +971,104 @@ void Classical_AMG_Level_Base<T_Config>::computeRestrictionOperator()
  **********************************************/
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Classical_AMG_Level<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::prepareCoarseningMatrix()
+{
+    Matrix<TConfig_h> &A = this->getA();
+
+    if (A.get_block_size() == 1)
+    {
+        return;
+    }
+
+    if (this->usesBlockGraphHierarchy())
+    {
+        FatalError("Classical block-graph BSR hierarchy is device-only",
+                   AMGX_ERR_NOT_IMPLEMENTED);
+    }
+
+    if (!A.is_matrix_singleGPU())
+    {
+        FatalError("Classical BSR setup is currently single-GPU only", AMGX_ERR_NOT_IMPLEMENTED);
+    }
+
+    this->releaseCoarseningMatrix();
+    this->m_coarsening_A = new Matrix<TConfig_h>();
+    const unsigned int props = CSR | (A.hasProps(DIAG) ? DIAG : 0);
+    this->m_coarsening_A->convert(A, props, 1, 1);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::prepareCoarseningMatrix()
+{
+    Matrix<TConfig_d> &A = this->getA();
+
+    if (A.get_block_size() == 1)
+    {
+        return;
+    }
+
+    if (!A.is_matrix_singleGPU())
+    {
+        FatalError("Classical BSR setup is currently single-GPU only", AMGX_ERR_NOT_IMPLEMENTED);
+    }
+
+    if (A.get_block_dimx() != A.get_block_dimy())
+    {
+        FatalError("Classical BSR setup requires square blocks", AMGX_ERR_NOT_SUPPORTED_BLOCKSIZE);
+    }
+
+    if (A.hasProps(DIAG))
+    {
+        FatalError("Classical BSR setup currently requires an internal diagonal",
+                   AMGX_ERR_NOT_IMPLEMENTED);
+    }
+
+    if (this->usesBlockGraphHierarchy())
+    {
+        this->releaseCoarseningMatrix();
+        this->m_coarsening_A = new Matrix<TConfig_d>();
+        const std::string strength_metric =
+            this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+                "block_graph_strength_metric", this->amg->m_cfg_scope);
+        const int strength_metric_id =
+            strength_metric == "diagonal_normalized_frobenius" ? 1
+            : strength_metric == "symmetric_inverse_diagonal_frobenius" ? 2
+            : 0;
+        Block_Graph_Ops<TConfig_d>::build_graph(
+            A, *this->m_coarsening_A, strength_metric_id);
+        return;
+    }
+
+    this->releaseCoarseningMatrix();
+    this->m_coarsening_A = new Matrix<TConfig_d>();
+    expand_bsr_to_scalar_matrix(A, *this->m_coarsening_A);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void Classical_AMG_Level<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::computeAOperator_1x1()
 {
+    Matrix<TConfig_h> &A = this->getCoarseningMatrix();
     this->Profile.tic("computeA");
     Matrix<TConfig_h> RA;
     RA.addProps(CSR);
-    RA.set_block_dimx(this->getA().get_block_dimx());
-    RA.set_block_dimy(this->getA().get_block_dimy());
+    RA.set_block_dimx(A.get_block_dimx());
+    RA.set_block_dimy(A.get_block_dimy());
     Matrix<TConfig_h> &RAP = this->getNextLevel( typename Matrix<TConfig_h>::memory_space( ) )->getA( );
     RAP.addProps(CSR);
-    RAP.set_block_dimx(this->getA().get_block_dimx());
-    RAP.set_block_dimy(this->getA().get_block_dimy());
-    Matrix<TConfig_h> &Atmp = this->getA();
-    multiplyMM(this->R, this->getA(), RA);
+    RAP.set_block_dimx(A.get_block_dimx());
+    RAP.set_block_dimy(A.get_block_dimy());
+    multiplyMM(this->R, A, RA);
     multiplyMM(RA, this->P, RAP);
     RAP.sortByRowAndColumn();
     RAP.set_initialized(1);
     this->Profile.toc("computeA");
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Classical_AMG_Level<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::computeAOperator_block_graph()
+{
+    FatalError("Classical block-graph BSR hierarchy is device-only",
+               AMGX_ERR_NOT_IMPLEMENTED);
 }
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
@@ -499,13 +1079,67 @@ void Classical_AMG_Level<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPr
 
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Classical_AMG_Level<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::markScalarGuidedCoarseFinePoints()
+{
+    FatalError("Scalar-guided block coarsening is device-only",
+               AMGX_ERR_NOT_IMPLEMENTED);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::markScalarGuidedCoarseFinePoints()
+{
+    typedef Vector<typename TConfig_d::template setVecPrec<AMGX_vecBool>::Type> BoolVector;
+    typedef Vector<typename TConfig_d::template setVecPrec<AMGX_vecFloat>::Type> FloatVector;
+    Matrix<TConfig_d> &block_A = this->getA();
+    Matrix<TConfig_d> &graph_A = this->getCoarseningMatrix();
+    Matrix<TConfig_d> scalar_A;
+    expand_bsr_to_scalar_matrix(block_A, scalar_A);
+
+    IVector scalar_cf_map(scalar_A.get_num_rows(), 0);
+    BoolVector scalar_s_con(scalar_A.get_num_nz(), false);
+    IVector scalar_scratch(scalar_A.get_num_rows(), 0);
+    FloatVector scalar_weights(scalar_A.get_num_rows(), 0.0);
+    this->strength->computeStrongConnectionsAndWeights(
+        scalar_A, scalar_s_con, scalar_weights, this->max_row_sum);
+    this->selector->markCoarseFinePoints(
+        scalar_A, scalar_weights, scalar_s_con,
+        scalar_cf_map, scalar_scratch);
+
+    if (block_A.get_num_rows() > 0)
+    {
+        const int threads = 256;
+        const int blocks = std::min(
+            AMGX_GRID_MAX_SIZE,
+            static_cast<int>((block_A.get_num_rows() + threads - 1) / threads));
+        collapse_scalar_cf_to_block_any_kernel<<<blocks, threads>>>(
+            scalar_cf_map.raw(), block_A.get_num_rows(),
+            block_A.get_block_dimx(), this->m_cf_map.raw());
+        cudaCheckError();
+    }
+
+    // D2 still operates on the scalar block graph, so rebuild its strong-edge
+    // mask independently of the coefficient-exact scalar guidance graph.
+    FloatVector block_weights(graph_A.get_num_rows(), 0.0);
+    thrust_wrapper::fill<TConfig_d::memSpace>(
+        this->m_s_con.begin(), this->m_s_con.end(), false);
+    cudaCheckError();
+    this->strength->computeStrongConnectionsAndWeights(
+        graph_A, this->m_s_con, block_weights, this->max_row_sum);
+    this->m_cf_map.dirtybit = 1;
+    this->selector->renumberAndCountCoarsePoints(
+        this->m_cf_map, this->m_num_coarse_vertices,
+        graph_A.get_num_rows());
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::computeAOperator_1x1()
 {
+    Matrix<TConfig_d> &A = this->getCoarseningMatrix();
     this->Profile.tic("computeA");
     Matrix<TConfig_d> &RAP = this->getNextLevel( device_memory( ) )->getA( );
     RAP.addProps(CSR);
-    RAP.set_block_dimx(this->getA().get_block_dimx());
-    RAP.set_block_dimy(this->getA().get_block_dimy());
+    RAP.set_block_dimx(A.get_block_dimx());
+    RAP.set_block_dimy(A.get_block_dimy());
     this->R.set_initialized( 0 );
     this->R.addProps( CSR );
     this->R.set_initialized( 1 );
@@ -531,8 +1165,8 @@ void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
 
         if ( this->getLevelIndex() == 0 )
         {
-            device_vector_alloc<int> num_nz( this->getA().row_offsets.size() );
-            amgx::thrust::adjacent_difference( this->getA().row_offsets.begin(), this->getA().row_offsets.end(), num_nz.begin() );
+            device_vector_alloc<int> num_nz( A.row_offsets.size() );
+            amgx::thrust::adjacent_difference( A.row_offsets.begin(), A.row_offsets.end(), num_nz.begin() );
             cudaCheckError();
             Result result = amgx::thrust::minmax_element( num_nz.begin() + 1, num_nz.end() );
             cudaCheckError();
@@ -540,7 +1174,7 @@ void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
             int max_size = *result.second;
             int sum = thrust_wrapper::reduce<AMGX_device>( num_nz.begin() + 1, num_nz.end() );
             cudaCheckError();
-            double avg_size = double(sum) / this->getA().get_num_rows();
+            double avg_size = double(sum) / A.get_num_rows();
             buffer << "SPMM: A: " << std::endl;
             buffer << "SPMM: Matrix avg row size: " << avg_size << std::endl;
             buffer << "SPMM: Matrix min row size: " << min_size << std::endl;
@@ -579,11 +1213,49 @@ void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
     }
 
     RAP.set_initialized( 0 );
-    CSR_Multiply<TConfig_d>::csr_galerkin_product( this->R, this->getA(), this->P, RAP, NULL, NULL, NULL, NULL, NULL, NULL, wk );
+    CSR_Multiply<TConfig_d>::csr_galerkin_product( this->R, A, this->P, RAP, NULL, NULL, NULL, NULL, NULL, NULL, wk );
     RAP.set_initialized( 1 );
     int spmm_no_sort = this->amg->m_cfg->AMG_Config::template getParameter<int>("spmm_no_sort", this->amg->m_cfg_scope);
     this->Profile.toc("computeA");
 }
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void Classical_AMG_Level<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::computeAOperator_block_graph()
+{
+    if (this->m_block_graph_P == NULL || this->m_block_graph_R == NULL)
+    {
+        FatalError("Missing scalar block-graph transfer weights", AMGX_ERR_INTERNAL);
+    }
+
+    Matrix<TConfig_d> &A = this->getA();
+    Matrix<TConfig_d> &graph_A = this->getCoarseningMatrix();
+    Matrix<TConfig_d> &RAP = this->getNextLevel(device_memory())->getA();
+    this->Profile.tic("computeA_block_graph");
+    void *wk = AMG_Level<TConfig_d>::amg->getCsrWorkspace();
+
+    if (wk == NULL)
+    {
+        wk = CSR_Multiply<TConfig_d>::csr_workspace_create(
+                 *(AMG_Level<TConfig_d>::amg->m_cfg),
+                 AMG_Level<TConfig_d>::amg->m_cfg_scope);
+        AMG_Level<TConfig_d>::amg->setCsrWorkspace(wk);
+    }
+
+    if (this->usesDenseBlockGraphHierarchy())
+    {
+        Block_Graph_Ops<TConfig_d>::dense_galerkin(
+            A, graph_A, *this->m_block_graph_R, *this->m_block_graph_P,
+            this->R, this->P, RAP, wk);
+    }
+    else
+    {
+        Block_Graph_Ops<TConfig_d>::weighted_galerkin(
+            A, graph_A, *this->m_block_graph_R, *this->m_block_graph_P,
+            RAP, wk);
+    }
+
+    this->Profile.toc("computeA_block_graph");
+}
+
 /**********************************************
  * computes the restriction: rr=R*r
  **********************************************/
@@ -614,12 +1286,45 @@ void Classical_AMG_Level_Base<T_Config>::restrictResidual(VVector &r, VVector &r
     }
 
 #if 1
+    // The hybrid hierarchy has scalar R over a contiguous fine BSR vector.
+    // The block-graph hierarchy already has a b x b restriction and needs no
+    // metadata reinterpretation.
+    const short fine_r_block_dimy = r.get_block_dimy();
+    const bool scalar_transfer_on_block_vector =
+        R.get_block_size() == 1 && fine_r_block_dimy > 1;
+
+    if (scalar_transfer_on_block_vector)
+    {
+        r.set_block_dimy(R.get_block_dimx());
+    }
+
     this->Profile.tic("restrictRes");
+
+    if (usesBlockGraphHierarchy() && P.is_matrix_singleGPU())
+    {
+        const size_t required_input = static_cast<size_t>(R.get_num_cols())
+                                      * R.get_block_dimx();
+        const size_t required_output = static_cast<size_t>(R.get_num_rows())
+                                       * R.get_block_dimy();
+
+        if (r.size() < required_input || rr.size() < required_output)
+        {
+            FatalError("Pure-BSR restriction vector size mismatch",
+                       AMGX_ERR_INTERNAL);
+        }
+    }
 
     // Disable speculative send of rr
     if (P.is_matrix_singleGPU())
     {
-        multiply( R, r, rr);
+        if (usesIdentityBlockGraphHierarchy())
+        {
+            Block_Graph_Ops<TConfig>::multiply_identity_transfer(R, r, rr);
+        }
+        else
+        {
+            multiply(R, r, rr);
+        }
     }
     else
     {
@@ -627,6 +1332,11 @@ void Classical_AMG_Level_Base<T_Config>::restrictResidual(VVector &r, VVector &r
     }
 
 #endif
+    if (scalar_transfer_on_block_vector)
+    {
+        r.set_block_dimy(fine_r_block_dimy);
+    }
+
     // exchange halo residuals & add residual contribution from neighbors
     rr.dirtybit = 1;
 
@@ -852,6 +1562,8 @@ template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::prolongateAndApplyCorrection(VVector &e, VVector &bc, VVector &x, VVector &tmp)
 {
     this->Profile.tic("proCorr");
+    const short fine_x_block_dimy = x.get_block_dimy();
+    const short fine_tmp_block_dimy = tmp.get_block_dimy();
     // Use P.manager to exchange halo of e before doing P
     // (since P has columns belonging to one of P.neighbors)
     e.dirtybit = 1;
@@ -885,7 +1597,28 @@ void Classical_AMG_Level_Base<T_Config>::prolongateAndApplyCorrection(VVector &e
     {
         if (e.size() > 0)
         {
-            multiply( P, e, tmp);
+            if (usesBlockGraphHierarchy())
+            {
+                const size_t required_input = static_cast<size_t>(P.get_num_cols())
+                                              * P.get_block_dimx();
+                const size_t required_output = static_cast<size_t>(P.get_num_rows())
+                                               * P.get_block_dimy();
+
+                if (e.size() < required_input || tmp.size() < required_output)
+                {
+                    FatalError("Pure-BSR prolongation vector size mismatch",
+                               AMGX_ERR_INTERNAL);
+                }
+            }
+
+            if (usesIdentityBlockGraphHierarchy())
+            {
+                Block_Graph_Ops<TConfig>::multiply_identity_transfer(P, e, tmp);
+            }
+            else
+            {
+                multiply(P, e, tmp);
+            }
         }
     }
     else
@@ -903,11 +1636,47 @@ void Classical_AMG_Level_Base<T_Config>::prolongateAndApplyCorrection(VVector &e
     }
     else
     {
-        owned_size = x.size();
+        // axpby() measures size in vector blocks and multiplies it by
+        // x.get_block_size().  In the pure-BSR hierarchy one vector block is
+        // one matrix block row, so passing the scalar size would multiply by
+        // the block dimension twice and overrun x/tmp.
+        owned_size = usesBlockGraphHierarchy()
+                     ? P.get_num_rows()
+                     : x.size();
     }
 
-    //apply
+    // Apply the correction. Only the hybrid scalar-transfer path needs a
+    // temporary scalar metadata view; pure-BSR transfers already preserve b.
+    const bool scalar_transfer_on_block_vector =
+        P.get_block_size() == 1 && fine_x_block_dimy > 1;
+
+    if (scalar_transfer_on_block_vector)
+    {
+        x.set_block_dimy(P.get_block_dimy());
+        tmp.set_block_dimy(P.get_block_dimy());
+    }
+
+    if (usesBlockGraphHierarchy())
+    {
+        const size_t x_entries = static_cast<size_t>(owned_size)
+                                 * x.get_block_size();
+        const size_t tmp_entries = static_cast<size_t>(owned_size)
+                                   * tmp.get_block_size();
+
+        if (x_entries > x.size() || tmp_entries > tmp.size())
+        {
+            FatalError("Pure-BSR correction vector extent mismatch",
+                       AMGX_ERR_INTERNAL);
+        }
+    }
+
     axpby(x, tmp, x, ValueType(1), ValueType(1), 0, owned_size);
+
+    if (scalar_transfer_on_block_vector)
+    {
+        x.set_block_dimy(fine_x_block_dimy);
+        tmp.set_block_dimy(fine_tmp_block_dimy);
+    }
     this->Profile.toc("proCorr");
     x.dirtybit = 1;
 }
@@ -915,19 +1684,31 @@ void Classical_AMG_Level_Base<T_Config>::prolongateAndApplyCorrection(VVector &e
 template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::computeAOperator()
 {
-    if (this->A->get_block_size() == 1)
+    if (usesBlockGraphHierarchy())
     {
-        computeAOperator_1x1();
+        computeAOperator_block_graph();
+        return;
     }
-    else
+
+    Matrix<TConfig> &A = getCoarseningMatrix();
+
+    if (A.get_block_size() != 1)
     {
-        FatalError("Classical AMG not implemented for block_size != 1", AMGX_ERR_NOT_IMPLEMENTED);
+        FatalError("Classical AMG coarsening matrix must be scalar", AMGX_ERR_INTERNAL);
     }
+
+    computeAOperator_1x1();
 }
 
 template <class T_Config>
 void Classical_AMG_Level_Base<T_Config>::computeAOperator_distributed()
 {
+    if (usesBlockGraphHierarchy())
+    {
+        FatalError("Distributed block-graph BSR hierarchy is not implemented",
+                   AMGX_ERR_NOT_IMPLEMENTED);
+    }
+
     if (this->A->get_block_size() == 1)
     {
         computeAOperator_1x1_distributed();

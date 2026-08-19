@@ -13,6 +13,39 @@
 
 namespace amgx
 {
+namespace
+{
+
+template <typename IndexType>
+__global__ void fill_index_sequence_kernel(IndexType *values, size_t count)
+{
+    for (size_t i = threadIdx.x + static_cast<size_t>(blockIdx.x) * blockDim.x;
+         i < count;
+         i += static_cast<size_t>(blockDim.x) * gridDim.x)
+    {
+        values[i] = static_cast<IndexType>(i);
+    }
+}
+
+template <typename VectorType>
+void fill_index_sequence(VectorType &values)
+{
+    const size_t count = values.size();
+
+    if (count == 0)
+    {
+        return;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = static_cast<int>(std::min<size_t>(
+                               AMGX_GRID_MAX_SIZE,
+                               (count + block_size - 1) / block_size));
+    fill_index_sequence_kernel<<<num_blocks, block_size>>>(values.raw(), count);
+    cudaCheckError();
+}
+
+} // namespace
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -401,7 +434,7 @@ template< AMGX_VecPrecision V, AMGX_MatPrecision M, AMGX_IndPrecision I > void C
     C.row_offsets.resize( A.get_num_rows() + 1 );
     C.col_indices.resize( C_num_nnz1 );
     C.m_seq_offsets.resize( A.get_num_rows() + 1 );
-    thrust_wrapper::sequence<AMGX_device>(C.m_seq_offsets.begin(), C.m_seq_offsets.end());
+    fill_index_sequence(C.m_seq_offsets);
     C.set_num_rows( A.get_num_rows() );
     C.set_num_cols( B.get_num_cols() );
     C.diag.resize(C.get_num_rows());
@@ -441,7 +474,7 @@ void CSR_Multiply_Impl<TemplateConfig<AMGX_device, V, M, I> >::multiply_opt(
     C.set_num_cols( B.get_num_cols() );
     C.row_offsets.resize( A.get_num_rows() + 1 );
     C.m_seq_offsets.resize( A.get_num_rows() + 1 );
-    thrust_wrapper::sequence<AMGX_device>(C.m_seq_offsets.begin(), C.m_seq_offsets.end());
+    fill_index_sequence(C.m_seq_offsets);
     cudaCheckError();
 
     bool cnz_success = this->count_non_zeroes_opt(A, B, C, 32);
@@ -489,7 +522,7 @@ void CSR_Multiply_Impl<TemplateConfig<AMGX_device, V, M, I> >::multiply( const M
     C.set_num_cols( B.get_num_cols() );
     C.row_offsets.resize( A.get_num_rows() + 1 );
     C.m_seq_offsets.resize( A.get_num_rows() + 1 );
-    thrust_wrapper::sequence<AMGX_device>(C.m_seq_offsets.begin(), C.m_seq_offsets.end());
+    fill_index_sequence(C.m_seq_offsets);
     cudaCheckError();
     bool done = false;
 
@@ -578,7 +611,7 @@ void CSR_Multiply_Impl<TemplateConfig<AMGX_device, V, M, I> >::sparse_add( Matri
     // Make C "mutable".
     RAP.set_initialized(0);
     RAP.m_seq_offsets.resize( RAP.get_num_rows() + 1 );
-    thrust_wrapper::sequence<AMGX_device>(RAP.m_seq_offsets.begin(), RAP.m_seq_offsets.end());
+    fill_index_sequence(RAP.m_seq_offsets);
     cudaCheckError();
     int attempt = 0;
 

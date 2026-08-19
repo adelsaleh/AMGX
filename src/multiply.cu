@@ -44,6 +44,8 @@ class Multiply_3x3;
 template <class Matrix, class Vector>
 class Multiply_4x4;
 template <class Matrix, class Vector>
+class Multiply_5x5;
+template <class Matrix, class Vector>
 class Multiply_bxb;
 
 template <typename TConfig>
@@ -63,6 +65,11 @@ void multiply_block_size(Matrix<TConfig> &A, Vector<TConfig> &B, Vector<TConfig>
     else if (A.get_block_dimy() == 4 && A.get_block_dimx() == 4)
     {
         Multiply_4x4<TMatrix, TVector>::multiply_4x4(A, B, C, view);
+    }
+    else if (A.get_block_dimy() == 5 && A.get_block_dimx() == 5
+             && A.template getParameter<int>("use_subgroup_5x5_spmv") != 0)
+    {
+        Multiply_5x5<TMatrix, TVector>::multiply_5x5(A, B, C, view);
     }
     else
     {
@@ -1031,6 +1038,131 @@ class Multiply_4x4
                 }
                 cudaCheckError();
             }
+        }
+};
+
+// One aligned eight-thread subgroup computes each 5x5 BSR block row. Five
+// lanes own the five scalar output rows; the remaining lanes are deliberately
+// idle so subgroups never straddle a warp.
+template <typename IndexType, typename ValueTypeA, typename ValueTypeB, bool row_major>
+__global__
+void blockDiaCsrMultiplyKernel_5x5_subgroup(const IndexType *row_offsets,
+                                            const IndexType *column_indices,
+                                            const ValueTypeA *nonzero_values,
+                                            const ValueTypeA *diagonal_values,
+                                            const ValueTypeB *x,
+                                            ValueTypeB *y,
+                                            IndexType num_block_rows,
+                                            IndexType row_offset)
+{
+    const int subgroup_width = 8;
+    const int block_size = 5;
+    const int subgroups_per_block = 128 / subgroup_width;
+    const int subgroup = threadIdx.x / subgroup_width;
+    const int lane = threadIdx.x % subgroup_width;
+
+    for (IndexType block_row_base = blockIdx.x * subgroups_per_block;
+         block_row_base < num_block_rows;
+         block_row_base += gridDim.x * subgroups_per_block)
+    {
+        const IndexType local_row = block_row_base + subgroup;
+
+        if (local_row < num_block_rows && lane < block_size)
+        {
+            const IndexType row = row_offset + local_row;
+            ValueTypeB sum = types::util<ValueTypeB>::get_zero();
+            const IndexType row_end = __cachingLoad(&row_offsets[row + 1]);
+
+            for (IndexType block = __cachingLoad(&row_offsets[row]); block < row_end; block++)
+            {
+                const IndexType column = __cachingLoad(&column_indices[block]);
+                const IndexType value_offset = block * block_size * block_size;
+
+#pragma unroll
+                for (int c = 0; c < block_size; c++)
+                {
+                    const int entry = row_major ? lane * block_size + c
+                                                : c * block_size + lane;
+                    sum = sum + __cachingLoad(&nonzero_values[value_offset + entry])
+                                * __cachingLoad(&x[column * block_size + c]);
+                }
+            }
+
+            if (diagonal_values != NULL)
+            {
+                const IndexType value_offset = row * block_size * block_size;
+
+#pragma unroll
+                for (int c = 0; c < block_size; c++)
+                {
+                    const int entry = row_major ? lane * block_size + c
+                                                : c * block_size + lane;
+                    sum = sum + __cachingLoad(&diagonal_values[value_offset + entry])
+                                * __cachingLoad(&x[row * block_size + c]);
+                }
+            }
+
+            y[row * block_size + lane] = sum;
+        }
+    }
+}
+
+template <class Matrix, class Vector>
+class Multiply_5x5
+{
+    public:
+        typedef typename Matrix::TConfig TConfig;
+        typedef typename TConfig::IndPrec IndexType;
+        typedef typename TConfig::MatPrec ValueTypeA;
+        typedef typename TConfig::VecPrec ValueTypeB;
+
+        static void multiply_5x5(Matrix &A, Vector &B, Vector &C, ViewType view)
+        {
+            if (TConfig::memSpace == AMGX_host)
+            {
+                if (A.hasProps(DIAG))
+                {
+                    multiply_common_sqblock_host_diag(A, B, C);
+                }
+                else
+                {
+                    multiply_common_sqblock_host_nodiag(A, B, C);
+                }
+                return;
+            }
+
+            IndexType row_offset, num_rows;
+            A.getOffsetAndSizeForView(view, &row_offset, &num_rows);
+
+            if (num_rows == 0)
+            {
+                return;
+            }
+
+            const int threads_per_block = 128;
+            const int subgroups_per_block = threads_per_block / 8;
+            const int num_blocks = std::min(
+                AMGX_GRID_MAX_SIZE,
+                (int) (num_rows - 1) / subgroups_per_block + 1);
+            const ValueTypeA *diagonal_values = A.hasProps(DIAG)
+                ? A.values.raw() + A.diagOffset() * 25
+                : NULL;
+
+            if (A.getBlockFormat() == ROW_MAJOR)
+            {
+                blockDiaCsrMultiplyKernel_5x5_subgroup<IndexType, ValueTypeA, ValueTypeB, true>
+                    <<<num_blocks, threads_per_block>>>(
+                        A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(),
+                        diagonal_values, B.raw(), C.raw(), num_rows, row_offset);
+            }
+            else
+            {
+                blockDiaCsrMultiplyKernel_5x5_subgroup<IndexType, ValueTypeA, ValueTypeB, false>
+                    <<<num_blocks, threads_per_block>>>(
+                        A.row_offsets.raw(), A.col_indices.raw(), A.values.raw(),
+                        diagonal_values, B.raw(), C.raw(), num_rows, row_offset);
+            }
+            cudaCheckError();
         }
 };
 
