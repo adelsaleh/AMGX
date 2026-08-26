@@ -11,9 +11,11 @@
 
 #include "solvers/multicolor_dilu_solver.h"
 
+#include <cmath>
 #include <iostream>
 
-// this test run same smoother for the same matrix with DIAG=true and DIAG=false. Runs for different blocksizes (1-7). checks if result is ~the same
+// This test runs the same smoother for the same matrix with DIAG=true and DIAG=false.
+// It covers supported block sizes 1-5 and checks that the result remains finite.
 
 namespace amgx
 {
@@ -123,6 +125,12 @@ void check_block_smoothers_random(int bsize, int rows, std::string smoother_stri
     x_h = x0;
     smoother0->solve(b0, x0, false);
     x_h = x0;
+
+    for (int row = 0; row < x_h.size(); ++row)
+    {
+        UNITTEST_ASSERT_TRUE(std::isfinite(static_cast<double>(x_h[row])));
+    }
+
     done = true;
     //for (int i=0;i<1;i++)
     int i = -1;
@@ -183,7 +191,7 @@ void run()
     std::stringstream err_msg;
     int mat_size = 1000;
 
-    for (int i = 1; i < 5; i++)
+    for (int i = 1; i <= 5; i++)
     {
         /*err_msg << "block jacobi, block_size= " << i ;
           check_block_smoothers_random(i, mat_size*i, "BLOCK_JACOBI", n_smoothing_steps,done) ;

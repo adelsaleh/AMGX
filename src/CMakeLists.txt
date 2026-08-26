@@ -27,6 +27,7 @@ set(tests_all ${tests_all}
     tests/gmres_reliable_residual.cu
     tests/bicgstab_residual.cu
     tests/krylov_bsr_spmv_backend.cu
+    tests/smoother_blocksizes.cu
     tests/dense_lu.cu)
 
 add_library(amgx_tests_libs OBJECT ${tests_all})
