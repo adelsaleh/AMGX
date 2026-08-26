@@ -598,6 +598,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("solver_verbose", "The solver will print information about its parameters, <0|1>", 0);
     AMG_Config::registerParameter<int>("print_config", "flag that allows to print the solver configuration <0|1>", 0);
     AMG_Config::registerParameter<int>("print_solve_stats", "flag that allows to print information about the solver convergence <0|1>", 0);
+    AMG_Config::registerParameter<int>("print_solve_stats_interval", "iteration interval for printed solver convergence rows (minimum 1)", 1);
     AMG_Config::registerParameter<int>("print_grid_stats", "flag that allows to print information about the amg hierarchy <0|1>", 0);
     AMG_Config::registerParameter<int>("print_vis_data", "flag that allows to print information about the solver convergence <0|1>", 0);
     AMG_Config::registerParameter<int>("print_aggregation_info", "flag that allows to print additional information about aggregation AMG hierarchy<0|1>", 0);
@@ -817,7 +818,11 @@ AMGX_ERROR initialize()
     int driver_version_min = (driver_version - (driver_version_maj * 1000)) / 10;
     int runtime_version_maj = runtime_version / 1000;
     int runtime_version_min = (runtime_version - (runtime_version_maj * 1000)) / 10;
-    info << "Compiled with CUDA Runtime " << runtime_version_maj << "." << runtime_version_min << ", using CUDA driver " << driver_version_maj << "." << driver_version_min << "\n";
+    const int toolkit_version_maj = CUDART_VERSION / 1000;
+    const int toolkit_version_min = (CUDART_VERSION % 1000) / 10;
+    info << "Compiled with CUDA Toolkit " << toolkit_version_maj << "." << toolkit_version_min
+         << "; loaded CUDA Runtime " << runtime_version_maj << "." << runtime_version_min
+         << "; using CUDA driver " << driver_version_maj << "." << driver_version_min << "\n";
     std::stringstream cuda_rt_version;
     cuda_rt_version << runtime_version_maj << "." << runtime_version_min;
 #ifdef AMGX_WITH_MPI

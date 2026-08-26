@@ -13,6 +13,7 @@
 #include <cusp/blas.h>
 #include <numerical_zero.h>
 #include <distributed/glue.h>
+#include <cmath>
 
 #include "amgx_types/util.h"
 
@@ -708,6 +709,21 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
                                    bool xIsZero)
 {
     PODValueB eps = (sizeof(PODValueB) == 4) ? AMGX_NUMERICAL_SZERO : AMGX_NUMERICAL_DZERO;
+    const int print_solve_stats_interval = std::max(
+            1,
+            this->m_cfg->AMG_Config::template getParameter<int>(
+                "print_solve_stats_interval", this->m_cfg_scope));
+    const auto display_norm = [](const PODVector_h &values) -> PODValueB
+    {
+        PODValueB squared = types::util<PODValueB>::get_zero();
+
+        for (int i = 0; i < static_cast<int>(values.size()); ++i)
+        {
+            squared += values[i] * values[i];
+        }
+
+        return std::sqrt(squared);
+    };
     AMGX_CPU_PROFILER("Solver::solve ");
 
     if (!m_is_solver_setup)
@@ -851,50 +867,54 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
     float solve_peak_used_gib = 0.0f;
     float solve_peak_held_gib = 0.0f;
 
-    // Print solve informations if needed.
+    // Print solve information if needed. Block systems retain componentwise
+    // convergence checks, but display one aggregate L2 norm so the table stays
+    // readable for high-order face BSR matrices.
     if (m_verbosity_level > 2 && getPrintSolveStats())
     {
         std::stringstream ss;
         solve_peak_used_gib = MemoryInfo::getMemoryUsage();
         solve_peak_held_gib = MemoryInfo::getReservedMemoryUsage();
-        const int table_width = 28 + 45 * static_cast<int>(m_nrm.size());
+        const int table_width = 73;
         ss << "  monitored residual: " << monitored_residual_description() << std::endl;
-        ss << "  stop criterion: " << convergence_description() << std::endl;
-        ss << std::setw(8) << "iter"
-           << std::setw(10) << "used"
-           << std::setw(10) << "held";
 
-        for (int i = 0; i < m_nrm.size(); i++)
+        if (m_nrm.size() > 1)
         {
-            const std::string suffix = m_nrm.size() == 1 ? "" : "[" + std::to_string(i) + "]";
-            ss << std::setw(15) << ("residual" + suffix)
-               << std::setw(15) << ("res/initial" + suffix)
-               << std::setw(15) << ("res/previous" + suffix);
+            ss << "  table norm: aggregate block L2; stopping remains componentwise" << std::endl;
         }
 
-        ss << std::endl;
+        ss << "  stop criterion: " << convergence_description() << std::endl;
+        ss << "  iteration rows: every " << print_solve_stats_interval << std::endl;
+        ss << std::setw(8) << "iter"
+           << std::setw(10) << "used"
+           << std::setw(10) << "held"
+           << std::setw(15) << "residual"
+           << std::setw(15) << "res/initial"
+           << std::setw(15) << "res/previous"
+           << std::endl;
         ss << std::setw(8) << ""
            << std::setw(10) << "GiB"
-           << std::setw(10) << "GiB";
-        ss << std::endl;
-        ss << "  " << std::string(table_width, '-');
-        ss << std::endl;
+           << std::setw(10) << "GiB"
+           << std::endl;
+        ss << "  " << std::string(table_width, '-') << std::endl;
         ss << std::setw(8) << "Ini"
            << std::fixed << std::setprecision(3)
            << std::setw(10) << solve_peak_used_gib
            << std::setw(10) << solve_peak_held_gib;
 
-        for (int i = 0; i < m_nrm.size(); i++)
+        const PODValueB initial_display_norm = display_norm(m_nrm_ini);
+        ss << std::scientific << std::setprecision(6) << std::setw(15) << display_norm(m_nrm);
+
+        if (initial_display_norm > types::util<PODValueB>::get_zero())
         {
-            ss << std::scientific << std::setprecision(6) << std::setw(15) << m_nrm[i];
-            if (m_nrm_ini[i] > types::util<PODValueB>::get_zero())
-                ss << std::scientific << std::setprecision(3) << std::setw(15) << PODValueB(1);
-            else
-                ss << std::setw(15) << "-";
+            ss << std::scientific << std::setprecision(3) << std::setw(15) << PODValueB(1);
+        }
+        else
+        {
             ss << std::setw(15) << "-";
         }
 
-        ss << std::endl;
+        ss << std::setw(15) << "-" << std::endl;
         amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
     }
 
@@ -957,31 +977,43 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
             const float held_gib = MemoryInfo::getReservedMemoryUsage();
             solve_peak_used_gib = std::max(solve_peak_used_gib, used_gib);
             solve_peak_held_gib = std::max(solve_peak_held_gib, held_gib);
-            ss.str(std::string());
-            ss.clear();
-            ss << std::setw(8) << m_curr_iter
-               << std::fixed << std::setprecision(3)
-               << std::setw(10) << used_gib
-               << std::setw(10) << held_gib;
-
-            for (int i = 0; i < last_nrm.size(); i++)
+            if (m_curr_iter % print_solve_stats_interval == 0 || done)
             {
-                ss << std::scientific << std::setprecision(6) << std::setw(15) << m_nrm[i];
-                if (m_nrm_ini[i] > types::util<PODValueB>::get_zero())
-                    ss << std::scientific << std::setprecision(3) << std::setw(15)
-                       << m_nrm[i] / m_nrm_ini[i];
-                else
-                    ss << std::setw(15) << "-";
+                const PODValueB current_display_norm = display_norm(m_nrm);
+                const PODValueB initial_display_norm = display_norm(m_nrm_ini);
+                const PODValueB previous_display_norm = display_norm(last_nrm);
+                ss.str(std::string());
+                ss.clear();
+                ss << std::setw(8) << m_curr_iter
+                   << std::fixed << std::setprecision(3)
+                   << std::setw(10) << used_gib
+                   << std::setw(10) << held_gib
+                   << std::scientific << std::setprecision(6) << std::setw(15) << current_display_norm;
 
-                if (last_nrm[i] > types::util<PODValueB>::get_zero())
+                if (initial_display_norm > types::util<PODValueB>::get_zero())
+                {
                     ss << std::scientific << std::setprecision(3) << std::setw(15)
-                       << m_nrm[i] / last_nrm[i];
+                       << current_display_norm / initial_display_norm;
+                }
                 else
+                {
                     ss << std::setw(15) << "-";
+                }
+
+                if (previous_display_norm > types::util<PODValueB>::get_zero())
+                {
+                    ss << std::scientific << std::setprecision(3) << std::setw(15)
+                       << current_display_norm / previous_display_norm;
+                }
+                else
+                {
+                    ss << std::setw(15) << "-";
+                }
+
+                ss << std::endl;
+                amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
             }
 
-            ss << std::endl;
-            amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
             last_nrm = m_nrm;
         }
 
@@ -1047,44 +1079,43 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
 #endif
     }
 
-    // Print residual convergence information
+    // Print residual convergence information.
     if (m_verbosity_level > 2 && getPrintSolveStats())
     {
         ss.str(std::string());
         ss.clear();
-        const int table_width = 28 + 45 * static_cast<int>(m_nrm.size());
-        ss << "  " << std::string(table_width, '-');
-        ss << std::endl;
+        const int table_width = 73;
+        const PODValueB initial_display_norm = display_norm(m_nrm_ini);
+        const PODValueB final_display_norm = display_norm(last_nrm);
+        ss << "  " << std::string(table_width, '-') << std::endl;
         ss << "         Total Iterations: " << m_num_iters << std::endl;
         ss << "         Geometric mean res/previous:";
 
-        for (int i = 0; i < last_nrm.size(); i++)
+        if (m_num_iters > 0 && initial_display_norm > eps)
         {
-            if (m_num_iters > 0 && m_nrm_ini[i] > eps)
-                ss << std::scientific << std::setprecision(4) << std::setw(15)
-                   << pow(last_nrm[i] / m_nrm_ini[i], types::util<PODValueB>::get_one() / m_num_iters);
-            else
-                ss << std::setw(15) << "-";
+            ss << std::scientific << std::setprecision(4) << std::setw(15)
+               << pow(final_display_norm / initial_display_norm,
+                      types::util<PODValueB>::get_one() / m_num_iters);
+        }
+        else
+        {
+            ss << std::setw(15) << "-";
         }
 
         ss << std::endl;
-        ss << "         Final monitored residual:";
-
-        for (int i = 0; i < last_nrm.size(); i++)
-        {
-            ss << std::scientific << std::setprecision(6) << std::setw(15) << last_nrm[i];
-        }
-
-        ss << std::endl;
+        ss << "         Final monitored residual:"
+           << std::scientific << std::setprecision(6) << std::setw(15) << final_display_norm
+           << std::endl;
         ss << "         Final residual/initial:    ";
 
-        for (int i = 0; i < last_nrm.size(); i++)
+        if (initial_display_norm > eps)
         {
-            if (m_nrm_ini[i] > eps)
-                ss << std::scientific << std::setprecision(6) << std::setw(15)
-                   << last_nrm[i] / m_nrm_ini[i];
-            else
-                ss << std::setw(15) << "-";
+            ss << std::scientific << std::setprecision(6) << std::setw(15)
+               << final_display_norm / initial_display_norm;
+        }
+        else
+        {
+            ss << std::setw(15) << "-";
         }
 
         ss << std::endl;
@@ -1097,11 +1128,9 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
            << " held=" << current_held_gib
            << "; sampled solve peak used=" << solve_peak_used_gib
            << " held=" << solve_peak_held_gib << std::endl;
-        ss << "  " << std::string(table_width, '-');
-        ss << std::endl;
+        ss << "  " << std::string(table_width, '-') << std::endl;
         amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
         ss.str(std::string());
-        // what should we use as comparison of block norm?
     }
 
     // print grid hierarchy
