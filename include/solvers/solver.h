@@ -211,6 +211,12 @@ class Solver : public AuxData
         bool getPrintGridStats();
         bool getPrintSolveStats();
 
+        // Apply the BSR SpMV backend selected in this solver's configuration
+        // scope to an explicit matrix. Krylov solvers call this during setup so
+        // their fine-operator SpMV does not depend on a preconditioner side
+        // effect to select the requested backend.
+        void configure_bsr_spmv_backend();
+
         // Equation scaler  NONE | BINORMALIZATION | DIAGONAL_SYMMETRIC
         std::string m_scaling;
 

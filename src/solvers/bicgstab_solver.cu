@@ -29,6 +29,9 @@ template<class T_Config>
 void
 BiCGStab_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
 {
+    // BICGSTAB owns the fine-operator SpMV directly. Configure it explicitly
+    // instead of relying on an unrelated smoother/preconditioner setup.
+    this->configure_bsr_spmv_backend();
     ViewType oldView = this->m_A->currentView();
     this->m_A->setView(OWNED);
     // The number of elements in temporary vectors.

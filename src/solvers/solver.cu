@@ -23,6 +23,17 @@
 namespace amgx
 {
 
+namespace
+{
+
+inline int bsr_spmv_backend_id(const std::string &backend)
+{
+    return backend == "cusparse_generic" ? 1
+           : backend == "custom_5x5" ? 2 : 0;
+}
+
+} // namespace
+
 template<class TConfig>
 Solver<TConfig>::Solver(AMG_Config &cfg, const std::string &cfg_scope,
                         ThreadManager *tmng) :
@@ -108,6 +119,37 @@ Solver<TConfig>::Solver(AMG_Config &cfg, const std::string &cfg_scope,
     // Reset times.
     m_setup_time = 0.0f;
     m_solve_time = 0.0f;
+}
+
+template<class TConfig>
+void Solver<TConfig>::configure_bsr_spmv_backend()
+{
+    Matrix<TConfig> *matrix = dynamic_cast<Matrix<TConfig> *>(this->m_A);
+
+    if (matrix == NULL)
+    {
+        return;
+    }
+
+    const std::string backend = this->m_cfg->AMG_Config::template getParameter<std::string>(
+                                    "bsr_spmv_backend", this->m_cfg_scope);
+    int effective_backend = bsr_spmv_backend_id(backend);
+
+#if CUDART_VERSION < 13000
+    if (effective_backend == 1)
+    {
+        if (matrix->amg_level_index == 0)
+        {
+            amgx_printf("Warning: bsr_spmv_backend=cusparse_generic requires "
+                        "CUDA Toolkit 13.0 or newer; falling back to legacy BSR SpMV.\n");
+        }
+
+        effective_backend = 0;
+    }
+#endif
+
+    matrix->setParameter("bsr_spmv_backend", effective_backend);
+    matrix->setParameter("use_subgroup_5x5_spmv", int(effective_backend == 2));
 }
 
 template<class TConfig>

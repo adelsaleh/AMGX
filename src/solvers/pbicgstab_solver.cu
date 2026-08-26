@@ -115,6 +115,11 @@ PBiCGStab_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
         m_preconditioner->setup( *this->m_A, reuse_matrix_structure );
     }
 
+    // The outer PBICGSTAB scope is authoritative for A*Mp and A*Ms. Apply it
+    // after preconditioner setup because a nested solver may also configure
+    // the shared fine matrix for its own SpMV implementation.
+    this->configure_bsr_spmv_backend();
+
     this->m_A->setView(oldView);
 }
 

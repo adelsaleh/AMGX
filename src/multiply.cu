@@ -54,7 +54,16 @@ void multiply_block_size(Matrix<TConfig> &A, Vector<TConfig> &B, Vector<TConfig>
     typedef Matrix<TConfig> TMatrix;
     typedef Vector<TConfig> TVector;
 
-    if (A.get_block_size() == 1)
+    // An explicit generic-cuSPARSE request must take precedence over AMGX's
+    // historical 3x3/4x4 specializations. Cusparse::bsrmv_internal retains the
+    // type/view/CUDA-version checks and safely falls back to legacy cuSPARSE
+    // BSR when the generic API cannot serve the requested view.
+    if (A.get_block_size() > 1
+            && A.template getParameter<int>("bsr_spmv_backend") == 1)
+    {
+        Multiply_bxb<TMatrix, TVector>::multiply_bxb(A, B, C, view);
+    }
+    else if (A.get_block_size() == 1)
     {
         Multiply_1x1<TMatrix, TVector>::multiply_1x1(A, B, C, view);
     }
