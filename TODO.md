@@ -6,6 +6,8 @@
 
 - [x] Add an opt-in `cusparse_generic` BSR SpMV reference backend for complete device views, with legacy fallback for partial/distributed views, unsupported precision combinations, and CUDA Toolkits older than 13.0.
   - CUDA/cuSPARSE 12.8 accepts `cusparseCreateBsr`, but its `cusparseSpMV_bufferSize` rejects BSR at runtime; the local smoke test therefore exercises and verifies the legacy fallback. Generic BSR SpMV arrived in CUDA Toolkit 13.0 Update 1. Gate it on `CUDART_VERSION`, because Toolkit 13.0 ships cuSPARSE library major 12 and `CUSPARSE_VER_MAJOR` is not a CUDA Toolkit version test.
+  - BICGSTAB and PBICGSTAB now propagate the backend selected in their outer solver scope directly to the fine matrix. PBICGSTAB reapplies the outer choice after nested preconditioner setup, so its `A*Mp` and `A*Ms` operations have deterministic backend ownership.
+  - An explicit `cusparse_generic` request now takes precedence over AMGX's historical 3x3 and 4x4 standalone kernels. The generic implementation retains complete-view, precision, square-block, and CUDA-version guards and falls back to legacy cuSPARSE BSR where required.
 - [x] Add opt-in subgroup kernels for the hot 5x5 BSR paths, retaining legacy cuSPARSE/two-`bsrmv` behavior when `block_jacobi_use_fused_small_blocks=0`.
   - The standalone SpMV and fused Block Jacobi specializations assign an aligned eight-thread subgroup to each block row. Five lanes compute the five output/residual components concurrently; Jacobi reuses its residual through shared memory for the inverse-diagonal update.
   - Store dispatch state on each matrix through copied `AuxData`, so hierarchy levels and concurrent solver objects do not depend on process-global state.
@@ -15,6 +17,8 @@
   - Do not use a process-global pointer-keyed cache: it is unsafe under matrix destruction, allocator address reuse, resetup, and concurrent solver objects.
   - Retain the legacy `cusparse*bsrmv` path for A/B tests and unsupported CUDA/type combinations.
 - [ ] Profile standalone BSR SpMV and complete AMG solves separately for block sizes 2 through 5. Record kernel time, launch count, achieved bandwidth, setup/preprocess cost, smoother time, coarse-level format changes, iterations, and end-to-end solve time.
+  - [x] Re-ran the HDG advection p=1..6 CSR/BSR sweep after rebuilding the 2026-08-24 BICGSTAB/PBICGSTAB propagation patch. Warmed alternating trials covered nx=64, 128, and 256. At nx=256, AMGX-solve speedups were 1.16x/0.97x/1.33x/1.00x/1.22x/1.31x for p=1..6. Nsight p=2 recorded generic `cusparseSpMV` and a 3x3 `bsrmv_tiny_core`, not the old AMGX custom kernel; the isolated BSR GPU SpMV work was about 1.42x faster than CSR, but block-vector reductions and per-call descriptor/workspace handling erased that gain for the complete p=2 solve. Detailed results are in the sibling HDG report `docs/backends/advection_bsr_benchmark_20260824.md`.
+  - [x] Screen direct PBICGSTAB+`MULTICOLOR_DILU` on the unstructured HDG advection matrix. Unscaled parallel-greedy DILU at weight 0.7 improves fine-mesh p=1..3 wall time over scalar-row L1, but loses at p=4. Trial 6x6/7x7 large-kernel dispatches fail to converge on p=5/6 and are not retained; do not infer support from a random finite-output smoke test.
 - [ ] Decide specialization policy from measurements: modern cuSPARSE for generic blocks, custom subgroup kernels for repeatedly hot awkward sizes, or a size/architecture-dependent dispatcher.
 
 ## P0 — classical AMG on BSR fine operators

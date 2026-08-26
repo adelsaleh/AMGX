@@ -3,6 +3,11 @@
 AmgX is a GPU accelerated core solver library that speeds up computationally intense linear solver portion of simulations. The library includes a flexible solver composition system that allows a user to easily construct complex nested solvers and preconditioners. The library is well suited for implicit unstructured methods.
 The AmgX library offers optimized methods for massive parallelism, the flexibility to choose how the solvers are constructed, and is accessible through a simple C API that abstracts the parallelism and scale across a single or multiple GPUs using user provided MPI.
 
+This workspace checkout carries documented downstream changes on top of NVIDIA
+AMGX on the `hdg-cuda13-integration` branch. See
+[LOCAL_CHANGES.md](LOCAL_CHANGES.md) before rebasing, rebuilding, or comparing
+behavior with upstream binaries.
+
 This is the source of the [AMGX library](https://developer.nvidia.com/amgx) on the NVIDIA Registered Developer Program portal.
 
 Key features of the library include:
