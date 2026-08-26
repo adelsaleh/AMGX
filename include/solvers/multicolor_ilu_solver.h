@@ -15,6 +15,7 @@ namespace multicolor_ilu_solver
 {
 
 template <class T_Config> class MulticolorILUSolver;
+template <class T_Config> class LegacyCusparseBsrIlu;
 
 template<class T_Config>
 class MulticolorILUSolver_Base : public Solver<T_Config>
@@ -52,9 +53,11 @@ class MulticolorILUSolver_Base : public Solver<T_Config>
         virtual void computeLUFactors(void) = 0;
         virtual void smooth_4x4(const VVector &b, VVector &x, bool xIsZero) = 0;
         virtual void smooth_bxb(const VVector &b, VVector &x, bool xIsZero) = 0;
+        virtual void smooth_cusparse_legacy(const VVector &b, VVector &x, bool xIsZero) = 0;
 
         Matrix<T_Config> *m_explicit_A;
         int m_use_bsrxmv;
+        bool m_use_cusparse_legacy_ilu;
         IndexType m_sparsity_level;
         ValueTypeB m_weight;
         IVector m_A_to_LU_mapping;
@@ -79,7 +82,7 @@ class MulticolorILUSolver_Base : public Solver<T_Config>
         // Setup the solver
         void solver_setup(bool reuse_matrix_structure);
 
-        bool isColoringNeeded() const { return true; }
+        bool isColoringNeeded() const { return !m_use_cusparse_legacy_ilu; }
 
         void getColoringScope( std::string &cfg_scope_for_coloring) const { cfg_scope_for_coloring = this->m_cfg_scope; }
 
@@ -121,6 +124,7 @@ class MulticolorILUSolver< TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_ind
         void computeLUFactors(void);
         void smooth_4x4( const VVector &b, VVector &x, bool xIsZero);
         void smooth_bxb( const VVector &b, VVector &x, bool xIsZero);
+        void smooth_cusparse_legacy(const VVector &b, VVector &x, bool xIsZero);
 };
 
 // ----------------------------
@@ -142,8 +146,8 @@ class MulticolorILUSolver< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_i
         typedef Vector<TConfig_d> VVector;
         typedef typename Matrix_d ::IVector IVector;
 
-        MulticolorILUSolver(AMG_Config &cfg, const std::string &cfg_scope) : MulticolorILUSolver_Base<TConfig_d>(cfg, cfg_scope) {}
-        ~MulticolorILUSolver() {};
+        MulticolorILUSolver(AMG_Config &cfg, const std::string &cfg_scope);
+        ~MulticolorILUSolver();
     private:
 
         void computeLUSparsityPattern(void);
@@ -152,6 +156,9 @@ class MulticolorILUSolver< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_i
         void computeLUFactors(void);
         void smooth_4x4(const VVector &b, VVector &x, bool xIsZero);
         void smooth_bxb(const VVector &b, VVector &x, bool xIsZero);
+        void smooth_cusparse_legacy(const VVector &b, VVector &x, bool xIsZero);
+
+        LegacyCusparseBsrIlu<TConfig_d> *m_cusparse_legacy_ilu;
 };
 
 template<class T_Config>

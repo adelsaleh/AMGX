@@ -19,6 +19,8 @@
 #include <thrust/logical.h>
 #include <sm_utils.inl>
 #include <algorithm>
+#include <sstream>
+#include <type_traits>
 
 // TODO: Have 2 groups of 16 threads collaborate
 // TODO: Add support for outside diagonal
@@ -33,6 +35,263 @@ namespace amgx
 
 namespace multicolor_ilu_solver
 {
+
+// CUDA 13 still ships these BSR ILU(0) and triangular-solve routines, but marks
+// them deprecated.  This adapter is deliberately an opt-in correctness and
+// performance oracle while AMGX evaluates a generic long-term backend.
+#define AMGX_DEFINE_LEGACY_BSR_ILU_API(TYPE, PREFIX) \
+static cusparseStatus_t legacy_ilu_buffer_size(cusparseHandle_t handle, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t descr, TYPE *values, const int *rows, const int *cols, int block_dim, bsrilu02Info_t info, int *bytes) \
+{ return cusparse##PREFIX##bsrilu02_bufferSize(handle, dir, mb, nnzb, descr, values, rows, cols, block_dim, info, bytes); } \
+static cusparseStatus_t legacy_ilu_analysis(cusparseHandle_t handle, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t descr, TYPE *values, const int *rows, const int *cols, int block_dim, bsrilu02Info_t info, void *buffer) \
+{ return cusparse##PREFIX##bsrilu02_analysis(handle, dir, mb, nnzb, descr, values, rows, cols, block_dim, info, CUSPARSE_SOLVE_POLICY_USE_LEVEL, buffer); } \
+static cusparseStatus_t legacy_ilu_factor(cusparseHandle_t handle, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t descr, TYPE *values, const int *rows, const int *cols, int block_dim, bsrilu02Info_t info, void *buffer) \
+{ return cusparse##PREFIX##bsrilu02(handle, dir, mb, nnzb, descr, values, rows, cols, block_dim, info, CUSPARSE_SOLVE_POLICY_USE_LEVEL, buffer); } \
+static cusparseStatus_t legacy_tri_buffer_size(cusparseHandle_t handle, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t descr, TYPE *values, const int *rows, const int *cols, int block_dim, bsrsv2Info_t info, int *bytes) \
+{ return cusparse##PREFIX##bsrsv2_bufferSize(handle, dir, CUSPARSE_OPERATION_NON_TRANSPOSE, mb, nnzb, descr, values, rows, cols, block_dim, info, bytes); } \
+static cusparseStatus_t legacy_tri_analysis(cusparseHandle_t handle, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t descr, const TYPE *values, const int *rows, const int *cols, int block_dim, bsrsv2Info_t info, void *buffer) \
+{ return cusparse##PREFIX##bsrsv2_analysis(handle, dir, CUSPARSE_OPERATION_NON_TRANSPOSE, mb, nnzb, descr, values, rows, cols, block_dim, info, CUSPARSE_SOLVE_POLICY_USE_LEVEL, buffer); } \
+static cusparseStatus_t legacy_tri_solve(cusparseHandle_t handle, cusparseDirection_t dir, int mb, int nnzb, const TYPE *alpha, const cusparseMatDescr_t descr, const TYPE *values, const int *rows, const int *cols, int block_dim, bsrsv2Info_t info, const TYPE *rhs, TYPE *solution, void *buffer) \
+{ return cusparse##PREFIX##bsrsv2_solve(handle, dir, CUSPARSE_OPERATION_NON_TRANSPOSE, mb, nnzb, alpha, descr, values, rows, cols, block_dim, info, rhs, solution, CUSPARSE_SOLVE_POLICY_USE_LEVEL, buffer); }
+
+AMGX_DEFINE_LEGACY_BSR_ILU_API(float, S)
+AMGX_DEFINE_LEGACY_BSR_ILU_API(double, D)
+#undef AMGX_DEFINE_LEGACY_BSR_ILU_API
+
+static void check_legacy_ilu_pivot(cusparseStatus_t status, int position,
+                                   const char *phase)
+{
+    if (status == CUSPARSE_STATUS_ZERO_PIVOT || position >= 0)
+    {
+        std::ostringstream message;
+        message << "cuSPARSE legacy BSR ILU(0) " << phase
+                << " zero pivot at block row " << position;
+        FatalError(message.str().c_str(), AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    cusparseCheckError(status);
+}
+
+template <class T_Config>
+class LegacyCusparseBsrIlu
+{
+    public:
+        typedef typename T_Config::MatPrec ValueTypeA;
+        typedef typename T_Config::VecPrec ValueTypeB;
+        typedef typename T_Config::IndPrec IndexType;
+        typedef Matrix<T_Config> MatrixType;
+        typedef Vector<T_Config> VectorType;
+
+        LegacyCusparseBsrIlu()
+            : m_descr_factor(0), m_descr_lower(0), m_descr_upper(0),
+              m_info_factor(0), m_info_lower(0), m_info_upper(0),
+              m_buffer(0), m_buffer_bytes(0), m_block_rows(0),
+              m_block_nnz(0), m_block_dim(0), m_ready(false)
+        {
+            cusparseCheckError(cusparseCreateMatDescr(&m_descr_factor));
+            cusparseCheckError(cusparseCreateMatDescr(&m_descr_lower));
+            cusparseCheckError(cusparseCreateMatDescr(&m_descr_upper));
+            cusparseCheckError(cusparseCreateBsrilu02Info(&m_info_factor));
+            cusparseCheckError(cusparseCreateBsrsv2Info(&m_info_lower));
+            cusparseCheckError(cusparseCreateBsrsv2Info(&m_info_upper));
+
+            cusparseCheckError(cusparseSetMatType(m_descr_factor, CUSPARSE_MATRIX_TYPE_GENERAL));
+            cusparseCheckError(cusparseSetMatIndexBase(m_descr_factor, CUSPARSE_INDEX_BASE_ZERO));
+
+            cusparseCheckError(cusparseSetMatType(m_descr_lower, CUSPARSE_MATRIX_TYPE_GENERAL));
+            cusparseCheckError(cusparseSetMatIndexBase(m_descr_lower, CUSPARSE_INDEX_BASE_ZERO));
+            cusparseCheckError(cusparseSetMatFillMode(m_descr_lower, CUSPARSE_FILL_MODE_LOWER));
+            cusparseCheckError(cusparseSetMatDiagType(m_descr_lower, CUSPARSE_DIAG_TYPE_UNIT));
+
+            cusparseCheckError(cusparseSetMatType(m_descr_upper, CUSPARSE_MATRIX_TYPE_GENERAL));
+            cusparseCheckError(cusparseSetMatIndexBase(m_descr_upper, CUSPARSE_INDEX_BASE_ZERO));
+            cusparseCheckError(cusparseSetMatFillMode(m_descr_upper, CUSPARSE_FILL_MODE_UPPER));
+            cusparseCheckError(cusparseSetMatDiagType(m_descr_upper, CUSPARSE_DIAG_TYPE_NON_UNIT));
+        }
+
+        ~LegacyCusparseBsrIlu()
+        {
+            if (m_buffer != 0)
+            {
+                cudaFree(m_buffer);
+            }
+
+            cusparseDestroyBsrilu02Info(m_info_factor);
+            cusparseDestroyBsrsv2Info(m_info_lower);
+            cusparseDestroyBsrsv2Info(m_info_upper);
+            cusparseDestroyMatDescr(m_descr_factor);
+            cusparseDestroyMatDescr(m_descr_lower);
+            cusparseDestroyMatDescr(m_descr_upper);
+        }
+
+        void setup_and_factor(MatrixType &LU)
+        {
+            if (!std::is_same<ValueTypeA, ValueTypeB>::value)
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) requires equal matrix and vector precision",
+                           AMGX_ERR_NOT_IMPLEMENTED);
+            }
+
+            if (!std::is_same<IndexType, int>::value)
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) requires 32-bit integer indices",
+                           AMGX_ERR_NOT_IMPLEMENTED);
+            }
+
+            if (LU.get_block_dimx() != LU.get_block_dimy() ||
+                LU.get_block_dimx() <= 0)
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) requires square, nonempty blocks",
+                           AMGX_ERR_BAD_PARAMETERS);
+            }
+
+            if (LU.get_num_rows() != LU.get_num_cols())
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) requires a square block matrix",
+                           AMGX_ERR_BAD_PARAMETERS);
+            }
+
+            if (LU.hasProps(DIAG))
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) requires an internal diagonal",
+                           AMGX_ERR_NOT_IMPLEMENTED);
+            }
+
+            if (LU.getColsReorderedByColor())
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) requires natural, non-color-reordered block columns",
+                           AMGX_ERR_BAD_PARAMETERS);
+            }
+
+            if (LU.getBlockFormat() != ROW_MAJOR)
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) currently accepts row-major BSR only",
+                           AMGX_ERR_NOT_IMPLEMENTED);
+            }
+
+            m_block_rows = LU.get_num_rows();
+            m_block_nnz = LU.get_num_nz();
+            m_block_dim = LU.get_block_dimx();
+            m_work.resize(m_block_rows * m_block_dim);
+
+            cusparseHandle_t handle = Cusparse::get_instance().get_handle();
+            const cusparseDirection_t direction = CUSPARSE_DIRECTION_ROW;
+            ValueTypeA *values = LU.values.raw();
+            const int *rows = reinterpret_cast<const int *>(LU.row_offsets.raw());
+            const int *cols = reinterpret_cast<const int *>(LU.col_indices.raw());
+            int factor_bytes = 0, lower_bytes = 0, upper_bytes = 0;
+
+            cusparseCheckError(cusparseSetStream(handle, 0));
+            cusparseCheckError(legacy_ilu_buffer_size(
+                handle, direction, m_block_rows, m_block_nnz, m_descr_factor,
+                values, rows, cols, m_block_dim, m_info_factor, &factor_bytes));
+            cusparseCheckError(legacy_tri_buffer_size(
+                handle, direction, m_block_rows, m_block_nnz, m_descr_lower,
+                values, rows, cols, m_block_dim, m_info_lower, &lower_bytes));
+            cusparseCheckError(legacy_tri_buffer_size(
+                handle, direction, m_block_rows, m_block_nnz, m_descr_upper,
+                values, rows, cols, m_block_dim, m_info_upper, &upper_bytes));
+
+            const size_t required_bytes = static_cast<size_t>(
+                std::max(factor_bytes, std::max(lower_bytes, upper_bytes)));
+
+            if (required_bytes > m_buffer_bytes)
+            {
+                if (m_buffer != 0)
+                {
+                    cudaFree(m_buffer);
+                    m_buffer = 0;
+                    m_buffer_bytes = 0;
+                }
+
+                cudaError_t allocation_status = cudaMalloc(&m_buffer, required_bytes);
+
+                if (allocation_status != cudaSuccess)
+                {
+                    FatalError("Failed to allocate cuSPARSE legacy BSR ILU(0) workspace",
+                               AMGX_ERR_NO_MEMORY);
+                }
+
+                m_buffer_bytes = required_bytes;
+            }
+
+            cusparseCheckError(legacy_ilu_analysis(
+                handle, direction, m_block_rows, m_block_nnz, m_descr_factor,
+                values, rows, cols, m_block_dim, m_info_factor, m_buffer));
+            int pivot = -1;
+            cusparseStatus_t pivot_status =
+                cusparseXbsrilu02_zeroPivot(handle, m_info_factor, &pivot);
+            check_legacy_ilu_pivot(
+                pivot_status, pivot, "structural analysis");
+
+            cusparseCheckError(legacy_ilu_factor(
+                handle, direction, m_block_rows, m_block_nnz, m_descr_factor,
+                values, rows, cols, m_block_dim, m_info_factor, m_buffer));
+            pivot = -1;
+            pivot_status =
+                cusparseXbsrilu02_zeroPivot(handle, m_info_factor, &pivot);
+            check_legacy_ilu_pivot(
+                pivot_status, pivot, "numeric factorization");
+
+            cusparseCheckError(legacy_tri_analysis(
+                handle, direction, m_block_rows, m_block_nnz, m_descr_lower,
+                values, rows, cols, m_block_dim, m_info_lower, m_buffer));
+            pivot = -1;
+            pivot_status =
+                cusparseXbsrsv2_zeroPivot(handle, m_info_lower, &pivot);
+            check_legacy_ilu_pivot(
+                pivot_status, pivot, "lower triangular analysis");
+
+            cusparseCheckError(legacy_tri_analysis(
+                handle, direction, m_block_rows, m_block_nnz, m_descr_upper,
+                values, rows, cols, m_block_dim, m_info_upper, m_buffer));
+            pivot = -1;
+            pivot_status =
+                cusparseXbsrsv2_zeroPivot(handle, m_info_upper, &pivot);
+            check_legacy_ilu_pivot(
+                pivot_status, pivot, "upper triangular analysis");
+            m_ready = true;
+        }
+
+        void solve(const MatrixType &LU, const VectorType &rhs,
+                   VectorType &solution, ValueTypeA relaxation)
+        {
+            if (!m_ready)
+            {
+                FatalError("cuSPARSE legacy BSR ILU(0) solve called before setup",
+                           AMGX_ERR_INTERNAL);
+            }
+
+            cusparseHandle_t handle = Cusparse::get_instance().get_handle();
+            const cusparseDirection_t direction = CUSPARSE_DIRECTION_ROW;
+            const ValueTypeA one = types::util<ValueTypeA>::get_one();
+            const ValueTypeA *values = LU.values.raw();
+            const int *rows = reinterpret_cast<const int *>(LU.row_offsets.raw());
+            const int *cols = reinterpret_cast<const int *>(LU.col_indices.raw());
+            const ValueTypeA *typed_rhs =
+                reinterpret_cast<const ValueTypeA *>(rhs.raw());
+            ValueTypeA *typed_solution =
+                reinterpret_cast<ValueTypeA *>(solution.raw());
+
+            cusparseCheckError(legacy_tri_solve(
+                handle, direction, m_block_rows, m_block_nnz, &one,
+                m_descr_lower, values, rows, cols, m_block_dim, m_info_lower,
+                typed_rhs, amgx::thrust::raw_pointer_cast(&m_work[0]), m_buffer));
+            cusparseCheckError(legacy_tri_solve(
+                handle, direction, m_block_rows, m_block_nnz, &relaxation,
+                m_descr_upper, values, rows, cols, m_block_dim, m_info_upper,
+                amgx::thrust::raw_pointer_cast(&m_work[0]), typed_solution, m_buffer));
+        }
+
+    private:
+        cusparseMatDescr_t m_descr_factor, m_descr_lower, m_descr_upper;
+        bsrilu02Info_t m_info_factor;
+        bsrsv2Info_t m_info_lower, m_info_upper;
+        void *m_buffer;
+        size_t m_buffer_bytes;
+        int m_block_rows, m_block_nnz, m_block_dim;
+        bool m_ready;
+        device_vector_alloc<ValueTypeA> m_work;
+};
 
 // -----------
 // Kernels
@@ -1423,6 +1682,24 @@ MulticolorILUSolver_Base<T_Config>::MulticolorILUSolver_Base( AMG_Config &cfg, c
         this->m_use_bsrxmv = 0;
     }
 
+    const std::string block_ilu_backend =
+        cfg.AMG_Config::template getParameter<std::string>("block_ilu_backend", cfg_scope);
+    m_use_cusparse_legacy_ilu = (block_ilu_backend == "cusparse_legacy");
+
+    if (m_use_cusparse_legacy_ilu)
+    {
+        if (m_sparsity_level != 0)
+        {
+            FatalError("block_ilu_backend=cusparse_legacy currently supports ILU(0) only",
+                       AMGX_ERR_NOT_IMPLEMENTED);
+        }
+
+        // Preserve the matrix's natural block ordering for the cuSPARSE oracle.
+        m_reorder_cols_by_color_desired = false;
+        m_insert_diagonal_desired = false;
+        m_use_bsrxmv = 0;
+    }
+
     if (m_weight == ValueTypeB(0.))
     {
         m_weight = 1.;
@@ -1438,6 +1715,24 @@ MulticolorILUSolver_Base<T_Config>::~MulticolorILUSolver_Base()
     m_A_to_LU_mapping.clear();
     m_A_to_LU_mapping.shrink_to_fit();
     m_LU.resize(0, 0, 0, 1);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::MulticolorILUSolver(
+    AMG_Config &cfg, const std::string &cfg_scope)
+    : MulticolorILUSolver_Base<TConfig_d>(cfg, cfg_scope),
+      m_cusparse_legacy_ilu(0)
+{
+    if (this->m_use_cusparse_legacy_ilu)
+    {
+        m_cusparse_legacy_ilu = new LegacyCusparseBsrIlu<TConfig_d>();
+    }
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::~MulticolorILUSolver()
+{
+    delete m_cusparse_legacy_ilu;
 }
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
@@ -1604,6 +1899,12 @@ void MulticolorILUSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPr
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::computeLUFactors()
 {
+    if (this->m_use_cusparse_legacy_ilu)
+    {
+        m_cusparse_legacy_ilu->setup_and_factor(this->m_LU);
+        return;
+    }
+
     const int CtaSize = 128; // Number of threads per CTA
     const int SMemSize = 128;
     const int nWarps = CtaSize / 32;
@@ -1730,7 +2031,8 @@ void
 MulticolorILUSolver_Base<T_Config>::pre_setup()
 {
     // Check if matrix is colored
-    if (this->m_explicit_A->getColoringLevel() < m_sparsity_level + 1)
+    if (!this->m_use_cusparse_legacy_ilu &&
+        this->m_explicit_A->getColoringLevel() < m_sparsity_level + 1)
     {
         FatalError("Matrix must be colored with coloring_level > sparsity_level for the multicolorILUsolver", AMGX_ERR_CONFIGURATION);
     }
@@ -1743,7 +2045,8 @@ MulticolorILUSolver_Base<T_Config>::pre_setup()
         FatalError("Multicolor ILU smoother does not support outside diagonal. Try setting reorder_cols_by_color=1 and insert_diag_while_reordering=1 in the multicolor_ilu solver scope in configuration file", AMGX_ERR_NOT_IMPLEMENTED);
     }
 
-    if (m_sparsity_level == 0 && !this->m_LU.getColsReorderedByColor())
+    if (m_sparsity_level == 0 && !this->m_use_cusparse_legacy_ilu &&
+        !this->m_LU.getColsReorderedByColor())
     {
         FatalError("Multicolor ILU smoother requires matrix to be reordered by color with ILU0 solver. Try setting reorder_cols_by_color=1 and insert_diag_while_reordering=1 in the multicolor_ilu solver scope in configuration file", AMGX_ERR_NOT_IMPLEMENTED);
     }
@@ -1782,6 +2085,9 @@ MulticolorILUSolver_Base<T_Config>::printSolverParameters() const
 {
     std::cout << "relaxation_factor = " << this->m_weight << std::endl;
     std::cout << "use_bsrxmv = " << this->m_use_bsrxmv << std::endl;
+    std::cout << "block_ilu_backend = "
+              << (this->m_use_cusparse_legacy_ilu ? "cusparse_legacy" : "amgx")
+              << std::endl;
     std::cout << "ilu_sparsity_level = " << this->m_sparsity_level <<  std::endl;
 }
 
@@ -1798,7 +2104,8 @@ MulticolorILUSolver_Base<T_Config>::solver_setup(bool reuse_matrix_structure)
         FatalError("MulticolorILUSolver only works with explicit matrices", AMGX_ERR_INTERNAL);
     }
 
-    if (this->m_explicit_A->getColoringLevel() < 1)
+    if (!this->m_use_cusparse_legacy_ilu &&
+        this->m_explicit_A->getColoringLevel() < 1)
     {
         FatalError("Matrix must be colored to use multicolor ilu solver. Try setting: coloring_level=1 or coloring_level=2 in the configuration file", AMGX_ERR_NOT_IMPLEMENTED);
     }
@@ -1825,7 +2132,11 @@ template<class T_Config>
 AMGX_STATUS
 MulticolorILUSolver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZero )
 {
-    if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 4 && this->m_LU.get_block_dimy() == 4) )
+    if (m_use_cusparse_legacy_ilu)
+    {
+        smooth_cusparse_legacy(b, x, xIsZero);
+    }
+    else if ( !m_use_bsrxmv && (this->m_LU.get_block_dimx() == 4 && this->m_LU.get_block_dimy() == 4) )
     {
         smooth_4x4(b, x, xIsZero);
     }
@@ -1842,6 +2153,35 @@ template<class T_Config>
 void
 MulticolorILUSolver_Base<T_Config>::solve_finalize( VVector &b, VVector &x )
 {}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void MulticolorILUSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_cusparse_legacy(
+    const VVector &b, VVector &x, bool xIsZero)
+{
+    FatalError("cuSPARSE legacy BSR ILU(0) is device-only",
+               AMGX_ERR_NOT_SUPPORTED_TARGET);
+}
+
+template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void MulticolorILUSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::smooth_cusparse_legacy(
+    const VVector &b, VVector &x, bool xIsZero)
+{
+    if (xIsZero)
+    {
+        m_cusparse_legacy_ilu->solve(
+            this->m_LU, b, x, (ValueTypeA)this->m_weight);
+        return;
+    }
+
+    amgx::thrust::copy(b.begin(), b.end(), this->m_delta.begin());
+    Cusparse::bsrmv((ValueTypeB)-1.0, *this->m_explicit_A, x,
+                    (ValueTypeB)1.0, this->m_delta);
+    m_cusparse_legacy_ilu->solve(
+        this->m_LU, this->m_delta, this->m_Delta,
+        (ValueTypeA)this->m_weight);
+    axpy(this->m_Delta, x, (ValueTypeB)1.0, 0, x.size());
+    cudaCheckError();
+}
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
 void MulticolorILUSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_4x4(const VVector &b, VVector &x, bool xIsZero)

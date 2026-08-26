@@ -412,6 +412,13 @@ inline void registerParameters()
     AMG_Config::registerParameter<std::string>("bsr_spmv_backend", "BSR SpMV implementation <legacy|cusparse_generic|custom_5x5>", "legacy", bsr_spmv_backend_values);
     //Richardson's iteration - ILU
     AMG_Config::registerParameter<int>("ilu_sparsity_level", "The multicolor_ilu solver sparsity level. 0:ILU0, 1:ILU1, etc <0>", 0);
+    std::vector<std::string> block_ilu_backend_values;
+    block_ilu_backend_values.push_back("amgx");
+    block_ilu_backend_values.push_back("cusparse_legacy");
+    AMG_Config::registerParameter<std::string>(
+        "block_ilu_backend",
+        "MULTICOLOR_ILU implementation <amgx|cusparse_legacy>; the legacy cuSPARSE path is an opt-in natural-order BSR ILU(0) oracle",
+        "amgx", block_ilu_backend_values);
     //Richardson's iteration - GS
     AMG_Config::registerParameter<int>("symmetric_GS", "Flag to control if GS smoother is symmetric or not <0|1>", 0);
     AMG_Config::registerParameter<int>("jacobi_iters", "the inner iterations for GSINNER", 5);
