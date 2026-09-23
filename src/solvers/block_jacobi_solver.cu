@@ -559,7 +559,7 @@ __global__ void matinv_matrix_per_thread_no_pivot (const T *A, T *Ainv, int batc
 
 template<typename IndexType, typename ValueTypeA, int threads_per_block, int halfwarps_per_block>
 __global__
-void setupBlockJacobiSmoothbBigBlockDiaCsrKernel(const IndexType *row_offsets, const IndexType *column_indices, const ValueTypeA *values, const IndexType *dia_indices, ValueTypeA *Dinv, const int num_block_rows, int bsize, int bsize_sq, ValueTypeA *temp1)
+void setupBlockJacobiSmoothbBigBlockDiaCsrKernel(const IndexType *row_offsets, const IndexType *column_indices, const ValueTypeA *values, const IndexType *dia_indices, ValueTypeA *Dinv, const int num_block_rows, int bsize, int bsize_sq)
 {
     const int tid = blockDim.x * blockIdx.x + threadIdx.x;
     int halfwarp_id = tid >> 4;
@@ -571,27 +571,21 @@ void setupBlockJacobiSmoothbBigBlockDiaCsrKernel(const IndexType *row_offsets, c
     volatile ValueTypeA *s_Amat;
     s_Amat = (ValueTypeA *)&schar[0];
     int tile_num = (bsize - 1) / 4 + 1;
-    ValueTypeA *e_out = &temp1[(blockIdx.x * blockDim.x + threadIdx.x) * tile_num * tile_num];
 
     while (halfwarp_id < num_block_rows)
     {
         int offset = halfwarp_id * bsize_sq + i_ind * bsize + j_ind;
         int s_offset = block_halfwarp_id * bsize_sq;
 
-        // Store the diagonal
+        // Load directly into the shared block. The former global staging
+        // buffer was sized by grid blocks but indexed by threads, overwriting
+        // other AMGX allocations once the grid exceeded eight blocks.
         for (int t1 = 0; t1 < tile_num; t1++)
             for (int t2 = 0; t2 < tile_num; t2++)
                 if ((t1 * 4 + i_ind) < bsize && (t2 * 4 + j_ind) < bsize)
                 {
-                    e_out[t1 * tile_num + t2] = values[bsize_sq * dia_indices[halfwarp_id] + (t1 * 4 + i_ind) * bsize + t2 * 4 + j_ind];
-                }
-
-        // Each thread stores its entry in s_Amat
-        for (int t1 = 0; t1 < tile_num; t1++)
-            for (int t2 = 0; t2 < tile_num; t2++)
-                if ((t1 * 4 + i_ind) < bsize && (t2 * 4 + j_ind) < bsize)
-                {
-                    types::util<ValueTypeA>::volcast( e_out[t1 * tile_num + t2], s_Amat + (s_offset + (t1 * 4 + i_ind) * bsize + t2 * 4 + j_ind) );
+                    const ValueTypeA entry = values[bsize_sq * dia_indices[halfwarp_id] + (t1 * 4 + i_ind) * bsize + t2 * 4 + j_ind];
+                    types::util<ValueTypeA>::volcast( entry, s_Amat + (s_offset + (t1 * 4 + i_ind) * bsize + t2 * 4 + j_ind) );
                 }
 
         compute_block_inverse2<IndexType, ValueTypeA, halfwarps_per_block>
@@ -930,6 +924,7 @@ BlockJacobiSolver_Base<T_Config>::BlockJacobiSolver_Base( AMG_Config &cfg, const
 {
     weight = cfg.AMG_Config::template getParameter<double>("relaxation_factor", cfg_scope);
     use_fused_small_blocks = cfg.AMG_Config::template getParameter<int>("block_jacobi_use_fused_small_blocks", cfg_scope) != 0;
+    zero_start_fastpath = cfg.AMG_Config::template getParameter<int>("block_jacobi_zero_start_fastpath", cfg_scope) != 0;
     const std::string spmv_backend = cfg.AMG_Config::template getParameter<std::string>("bsr_spmv_backend", cfg_scope);
     bsr_spmv_backend = spmv_backend == "cusparse_generic" ? 1
                        : spmv_backend == "custom_5x5" ? 2 : 0;
@@ -954,6 +949,7 @@ BlockJacobiSolver_Base<T_Config>::printSolverParameters() const
 {
     std::cout << "relaxation_factor= " << this->weight << std::endl;
     std::cout << "block_jacobi_use_fused_small_blocks= " << this->use_fused_small_blocks << std::endl;
+    std::cout << "block_jacobi_zero_start_fastpath= " << this->zero_start_fastpath << std::endl;
     std::cout << "bsr_spmv_backend= "
               << (this->bsr_spmv_backend == 1 ? "cusparse_generic"
                   : this->bsr_spmv_backend == 2 ? "custom_5x5" : "legacy")
@@ -1041,13 +1037,7 @@ BlockJacobiSolver_Base<T_Config>::solve_iteration( VVector &b, VVector &x, bool 
     }
     else if (A_as_matrix->get_block_dimx() == A_as_matrix->get_block_dimy())
     {
-        if (xIsZero)
-        {
-            thrust_wrapper::fill<T_Config::memSpace>(x.begin(), x.end(), types::util<ValueTypeB>::get_zero());
-            cudaCheckError();
-        }
-
-        smooth_BxB(*A_as_matrix, b, x, true, flags);
+        smooth_BxB(*A_as_matrix, b, x, xIsZero, flags);
     }
     else
     {
@@ -1261,15 +1251,13 @@ void BlockJacobiSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPr
     const IndexType *A_dia_idx_ptr = A.diag.raw();
     ValueTypeA *Dinv_ptr = this->Dinv.raw();
     const ValueTypeA *A_nonzero_values_ptr = A.values.raw();
-    MVector temp(AMGX_GRID_MAX_SIZE * ((bsize - 1) / 4 + 1) * ((bsize - 1) / 4 + 1));
-    ValueTypeA *temp_ptr = temp.raw();
     // MUST BE MULTIPLE OF 16
     const int threads_per_block = 512;
     const int halfwarps_per_block = threads_per_block / 16;
     const int num_blocks = std::min(AMGX_GRID_MAX_SIZE, (int) (A.get_num_rows() - 1) / halfwarps_per_block + 1);
     cudaFuncSetCacheConfig(setupBlockJacobiSmoothbBigBlockDiaCsrKernel<IndexType, ValueTypeA, threads_per_block, halfwarps_per_block>, cudaFuncCachePreferL1);
     setupBlockJacobiSmoothbBigBlockDiaCsrKernel<IndexType, ValueTypeA, threads_per_block, halfwarps_per_block> <<< num_blocks, threads_per_block, sizeof(ValueTypeA)*bsize *bsize *halfwarps_per_block>>>
-    (A_row_offsets_ptr, A_column_indices_ptr, A_nonzero_values_ptr, A_dia_idx_ptr, Dinv_ptr, A.get_num_rows(), bsize, bsize * bsize, temp_ptr);
+    (A_row_offsets_ptr, A_column_indices_ptr, A_nonzero_values_ptr, A_dia_idx_ptr, Dinv_ptr, A.get_num_rows(), bsize, bsize * bsize);
     cudaCheckError();
 }
 
@@ -1304,7 +1292,7 @@ void BlockJacobiSolver_Base<T_Config>::computeDinv_bxb(const Matrix<T_Config> &A
 }
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
-void BlockJacobiSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_BxB(Matrix_h &A, VVector &b, VVector &x, bool firstStep, ViewType separation_flags)
+void BlockJacobiSolver<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> >::smooth_BxB(Matrix_h &A, VVector &b, VVector &x, bool xIsZero, ViewType separation_flags)
 {
     FatalError("M*M Block Jacobi smoother not implemented with host format, exiting", AMGX_ERR_NOT_IMPLEMENTED);
 }
@@ -1519,13 +1507,35 @@ void BlockJacobiSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPr
 }
 
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
-void BlockJacobiSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::smooth_BxB(Matrix_d &A, VVector &b, VVector &x, bool firstStep, ViewType separation_flags)
+void BlockJacobiSolver<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::smooth_BxB(Matrix_d &A, VVector &b, VVector &x, bool xIsZero, ViewType separation_flags)
 {
     IndexType num_rows;
     IndexType offset;
     A.getOffsetAndSizeForView(separation_flags, &offset, &num_rows);
 
     const int bsize = A.get_block_dimx();
+
+    // A zero-start Jacobi correction is w*Dinv*b. Reuse the diagonal BSR
+    // multiply with beta=0, avoiding the full A*0, RHS copy, and x clear.
+    // Limit this opt-in path to complete single-GPU large-block vectors;
+    // the existing small-block and distributed paths keep their behavior.
+    if (this->zero_start_fastpath && xIsZero && bsize > 5
+        && A.is_matrix_singleGPU() && offset == 0 && num_rows > 0
+        && num_rows == A.get_num_rows() && num_rows == A.get_num_cols()
+        && x.size() == num_rows * bsize && b.size() == x.size())
+    {
+        Cusparse::bsrmv(types::util<ValueTypeB>::get_one() * this->weight,
+                       A, this->Dinv, b, types::util<ValueTypeB>::get_zero(),
+                       x, separation_flags);
+        cudaCheckError();
+        return;
+    }
+
+    if (xIsZero)
+    {
+        thrust_wrapper::fill<AMGX_device>(x.begin(), x.end(), types::util<ValueTypeB>::get_zero());
+        cudaCheckError();
+    }
 
     if (this->use_fused_small_blocks && (bsize == 2 || bsize == 3 || bsize == 5))
     {

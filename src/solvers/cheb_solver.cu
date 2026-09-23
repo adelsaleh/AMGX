@@ -6,6 +6,8 @@
 #include <operators/solver_operator.h>
 #include <blas.h>
 #include <util.h>
+#include <cmath>
+#include <cstdint>
 
 #include <thrust/extrema.h> // for amgx::thrust::max_element
 
@@ -83,10 +85,12 @@ Chebyshev_Solver<T_Config>::Chebyshev_Solver( AMG_Config &cfg, const std::string
     cfg.getParameter<std::string>( "preconditioner", solverName, cfg_scope, new_scope );
     m_lambda_mode = cfg.AMG_Config::template getParameter<int>("chebyshev_lambda_estimate_mode", cfg_scope);
     m_cheby_order = cfg.AMG_Config::template getParameter<int>("chebyshev_polynomial_order", cfg_scope);
+    m_reuse_initial_preconditioner = cfg.AMG_Config::template getParameter<int>("chebyshev_reuse_initial_preconditioner", cfg_scope) != 0;
     // 0 - use eigensolver to get BOTH estimates
     // 1 - use eigensolver to get maximum estimate
     // 2 - use max sum of abs values as a rough estimate for maximum eigenvalue
     // 3 - use user provided cheby_max_lambda and cheby_min_lambda
+    // 4 - estimate the SPD preconditioned maximum with weighted power iteration
 
     if (m_lambda_mode == 3)
     {
@@ -154,7 +158,83 @@ Chebyshev_Solver<T_Config>::solver_setup(bool reuse_matrix_structure)
     // 0: use eigensolver to get lmin and lmax estimate
     // 1: use eigensolver to get lmax estimate, set lmin = lmax/8
     // 2: use max row sum as lmax estimate, set lmin = lmax/8
-    if (m_lambda_mode < 2)
+    // 4: weighted power estimate, independent of the optional eigensolver plugin
+    if (m_lambda_mode == 4)
+    {
+        // For an SPD correction B, AB is self-adjoint in the B inner product.
+        // Normalize x with x^T B x and estimate lambda as (Bx)^T A(Bx).
+        // This avoids applying Euclidean Lanczos to the nonsymmetric AB and
+        // uses only existing block solves, SpMV, and BLAS operations.
+        Operator<T_Config> &A = *this->m_A;
+        int offset, size;
+        A.getOffsetAndSizeForView(A.getViewExterior(), &offset, &size);
+        Vector_h seed(this->m_buffer_N);
+        std::uint32_t state = 0x6d2b79f5u;
+
+        for (int i = 0; i < this->m_buffer_N; ++i)
+        {
+            state = 1664525u * state + 1013904223u;
+            seed[i] = ValueTypeB(double(state >> 8) / 16777216.0 - 0.5);
+        }
+
+        VVector power(seed), correction(this->m_buffer_N), image(this->m_buffer_N);
+        VVector *vectors[] = {&power, &correction, &image};
+
+        for (int i = 0; i < 3; ++i)
+        {
+            vectors[i]->set_block_dimy(A.get_block_dimy());
+            vectors[i]->set_block_dimx(1);
+            vectors[i]->dirtybit = 1;
+            vectors[i]->delayed_send = 1;
+            vectors[i]->tag = this->tag * 100 + 11 + i;
+        }
+
+        ValueTypeB estimate = ValueTypeB(0);
+
+        // Setup only: keep the resulting polynomial fixed throughout solves.
+        for (int iteration = 0; iteration < 128; ++iteration)
+        {
+            if (no_preconditioner)
+            {
+                copy(power, correction, offset, size);
+            }
+            else
+            {
+                m_preconditioner->solve(power, correction, true);
+            }
+
+            ValueTypeB norm_squared = dot(A, power, correction);
+
+            if (!(norm_squared > ValueTypeB(0)) || !std::isfinite(norm_squared))
+            {
+                FatalError("Chebyshev power estimate requires a positive definite fixed correction", AMGX_ERR_CONFIGURATION);
+            }
+
+            ValueTypeB inverse_norm = ValueTypeB(1) / std::sqrt(norm_squared);
+            scal(power, inverse_norm, offset, size);
+            scal(correction, inverse_norm, offset, size);
+            A.apply(correction, image);
+            estimate = dot(A, correction, image);
+
+            if (!(estimate > ValueTypeB(0)) || !std::isfinite(estimate))
+            {
+                FatalError("Chebyshev power estimate requires a positive definite operator", AMGX_ERR_CONFIGURATION);
+            }
+
+            copy(image, power, offset, size);
+        }
+
+        this->m_lmax = ValueTypeB(1.1) * estimate;
+        this->m_lmin = this->m_lmax * ValueTypeB(0.125);
+
+        if (this->m_verbosity_level > 0)
+        {
+            amgx_printf("Chebyshev power spectrum: rows=%d block_size=%d min=%.12e max=%.12e iterations=128\n",
+                        int(A.get_num_rows()), int(A.get_block_dimy()),
+                        double(this->m_lmin), double(this->m_lmax));
+        }
+    }
+    else if (m_lambda_mode < 2)
     {
         if (!no_preconditioner)
         {
@@ -295,18 +375,23 @@ Chebyshev_Solver<T_Config>::solve_iteration( VVector &b, VVector &x, bool xIsZer
 
     for (int i = 0; i < m_cheby_order; i++)
     {
-        // apply precond
-        if (no_preconditioner)
+        // solve_init already put B*r in m_p. Its first polynomial stage
+        // does not use m_z, so a fixed preconditioner need not run twice.
+        // Keep the legacy call sequence unless explicitly enabled.
+        if (!m_reuse_initial_preconditioner || first_iter != 0)
         {
-            copy(*this->m_r, m_z, offset, size);
-        }
-        else
-        {
-            m_z.delayed_send = 1;
-            this->m_r->delayed_send = 1;
-            m_preconditioner->solve( *this->m_r, m_z, true );
-            m_z.delayed_send = 1;
-            this->m_r->delayed_send = 1;
+            if (no_preconditioner)
+            {
+                copy(*this->m_r, m_z, offset, size);
+            }
+            else
+            {
+                m_z.delayed_send = 1;
+                this->m_r->delayed_send = 1;
+                m_preconditioner->solve( *this->m_r, m_z, true );
+                m_z.delayed_send = 1;
+                this->m_r->delayed_send = 1;
+            }
         }
 
         if (first_iter == 0)
@@ -352,6 +437,8 @@ template<class T_Config>
 void
 Chebyshev_Solver<T_Config>::printSolverParameters() const
 {
+    std::cout << "chebyshev_reuse_initial_preconditioner= "
+              << this->m_reuse_initial_preconditioner << std::endl;
     if (!no_preconditioner)
     {
         std::cout << "preconditioner: " << this->m_preconditioner->getName()

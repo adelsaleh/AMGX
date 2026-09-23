@@ -85,6 +85,12 @@ class FGMRES_Solver : public Solver<T_Config>
                        : MONITORED_RESIDUAL_RECURSIVE;
         }
 
+        bool is_current_solution_available(AMGX_STATUS status) const
+        {
+            return update_x_every_iteration || this->m_curr_iter % m_R == m_R - 1
+                   || this->is_last_iter() || isDone(status);
+        }
+
         void solve_init( VVector &b, VVector &x, bool xIsZero );
         // Run a single iteration. Compute the residual and its norm and decide convergence.
         bool solve_one_iteration( VVector &b, VVector &x );

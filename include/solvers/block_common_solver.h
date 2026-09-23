@@ -344,6 +344,10 @@ void compute_block_inverse2( volatile ValueType *s_Amat, const int s_offset, con
 #define s_A2_rval(ROW,COL)   types::util<ValueType>::volcast(s_Amat[s_offset+(ROW)*bsize+(COL)])
 ValueType diag;
 ValueType tmp;
+    // Each block is inverted by 16 lanes. Volatile shared accesses alone do
+    // not synchronize those lanes on GPUs with independent thread scheduling.
+    const unsigned int halfwarp_mask = 0xffffu << (threadIdx.x & 16);
+    __syncwarp(halfwarp_mask);
 
     for (int row = 0; row < bsize; row++)
     {
@@ -355,14 +359,16 @@ ValueType tmp;
                 tmp = s_A2_rval(row, j_ind + t2 * 4) * diag;
                 s_A2_lval(tmp, row, j_ind + t2 * 4);
             }
+        __syncwarp(halfwarp_mask);
 
         for (int t1 = 0; t1 < tile_num; t1++)
             for (int t2 = 0; t2 < tile_num; t2++)
                 if ((i_ind + t1 * 4 != row) && !(j_ind + t2 * 4 == row) && ((t1 * 4 + i_ind) < bsize) && ((t2 * 4 + j_ind) < bsize))
                 {
-                    tmp = types::util<ValueType>::invert((s_A2_rval(i_ind + t1 * 4, row) * s_A2_rval(row, j_ind + t2 * 4)) + s_A2_rval(i_ind + t1 * 4, j_ind + t2 * 4));
+                    tmp = s_A2_rval(i_ind + t1 * 4, j_ind + t2 * 4) - s_A2_rval(i_ind + t1 * 4, row) * s_A2_rval(row, j_ind + t2 * 4);
                     s_A2_lval(tmp, i_ind + t1 * 4, j_ind + t2 * 4);
                 }
+        __syncwarp(halfwarp_mask);
 
         for (int t2 = 0; t2 < tile_num; t2++)
             if (i_ind == 0 && (t2 * 4 + j_ind) < bsize)
@@ -370,6 +376,7 @@ ValueType tmp;
                 tmp = ((j_ind + t2 * 4) == row) ? diag : types::util<ValueType>::invert(s_A2_rval(j_ind + t2 * 4, row) * diag);
                 s_A2_lval(tmp, j_ind + t2 * 4, row)
             }
+        __syncwarp(halfwarp_mask);
     }
 
     for (int t1 = 0; t1 < tile_num; t1++)
@@ -378,6 +385,7 @@ ValueType tmp;
             {
                 Einv[e_offset + t1 * 4 * bsize + t2 * 4] = s_A2_rval(i_ind + t1 * 4, j_ind + t2 * 4);
             }
+    __syncwarp(halfwarp_mask);
 }
 
 } // namespace amgx

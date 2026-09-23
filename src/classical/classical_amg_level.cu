@@ -6,6 +6,7 @@
 
 #include <classical/classical_amg_level.h>
 #include <classical/block_graph.h>
+#include <classical/hierarchy_diagnostics.h>
 #include <amg_level.h>
 
 #include <basic_types.h>
@@ -433,7 +434,10 @@ Classical_AMG_Level_Base<T_Config>::Classical_AMG_Level_Base(AMG_Class *amg) : A
                 || !(smoothing_weight > 0.0) || !(smoothing_weight <= 2.0)
                 || smoothing_steps < 1 || smoothing_steps > 8
                 || (constraint_mode != "additive"
-                    && constraint_mode != "right_normalize")
+                    && constraint_mode != "right_normalize"
+                    && constraint_mode != "constant_vector")
+                || (constraint_mode == "constant_vector"
+                    && interpolation_mode != "jacobi")
                 || !(pivot_tolerance > 0.0)
                 || !(constraint_tolerance > 0.0))
         {
@@ -715,6 +719,20 @@ void Classical_AMG_Level_Base<T_Config>::createCoarseMatrices()
         this->getNextLevel(typename Matrix<TConfig>::memory_space())->getA().getOffsetAndSizeForView(FULL, &offset, &size);
         this->m_next_level_size = size * this->getNextLevel(typename Matrix<TConfig>::memory_space() )->getA().get_block_dimy();
     }
+    const std::string export_prefix = this->amg->m_cfg->AMG_Config::template getParameter<std::string>(
+        "classical_hierarchy_export_prefix", this->amg->m_cfg_scope);
+    if (!export_prefix.empty())
+    {
+        const int level = this->getLevelIndex();
+        export_hierarchy_matrix(export_prefix, level, level, "P", P);
+        export_hierarchy_matrix(export_prefix, level, level, "R", R);
+        export_hierarchy_matrix(export_prefix, level + 1, level, "A", RAP);
+        // Set after copyAuxData so RAP does not inherit its parent's identity.
+        this->getA().setParameter("classical_hierarchy_operator", "L" + std::to_string(level) + ".A");
+        P.setParameter("classical_hierarchy_operator", "L" + std::to_string(level) + ".P");
+        R.setParameter("classical_hierarchy_operator", "L" + std::to_string(level) + ".R");
+        RAP.setParameter("classical_hierarchy_operator", "L" + std::to_string(level + 1) + ".A");
+    }
     releaseCoarseningMatrix();
 }
 
@@ -862,7 +880,8 @@ void Classical_AMG_Level_Base<T_Config>::computeProlongationOperator()
                 Block_Graph_Ops<TConfig>::smooth_dense_transfer(
                     block_A, *generated_P, smoothing_weight, smoothing_steps,
                     constraint_mode == "right_normalize", pivot_tolerance,
-                    constraint_tolerance, P);
+                    constraint_tolerance, P, &this->m_cf_map,
+                    constraint_mode == "constant_vector");
             }
         }
         else

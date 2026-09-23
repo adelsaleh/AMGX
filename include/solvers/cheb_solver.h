@@ -34,6 +34,7 @@ class Chebyshev_Solver : public Solver<T_Config>
         double m_user_max_lambda, m_user_min_lambda;
 
         bool no_preconditioner;
+        bool m_reuse_initial_preconditioner;
         Solver<T_Config> *m_preconditioner;
         EigenSolver<T_Config> *m_eigsolver;
 

@@ -127,7 +127,7 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
             }
 
             // Iterate over the elements in the columns.
-            for ( ; a_col_begin < a_col_end ; a_col_begin += NxN )
+            for ( ; a_col_begin < a_col_end ; a_col_begin += WARP_SIZE )
             {
                 // Each thread loads a single element. If !is_active, a_col_end == 0.
                 int a_col_it = a_col_begin + lane_id;
@@ -164,6 +164,7 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
 
                 my_s_a_col_ids[dest] = a_col_id;
                 my_s_a_col_its[dest] = a_col_it;
+                utils::syncwarp();
                 // Temporary storage with zeros for OOB
                 Vector_type my_A[NUM_WARP_ITERS_PER_BLOCK], my_B[NUM_WARP_ITERS_PER_BLOCK];
 #pragma unroll
@@ -206,20 +207,28 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
                         my_s_B_mtx[lane_id + wb * WARP_SIZE] = my_B[wb];
                     }
 
+                    utils::syncwarp();
+
                     // Compute the product of matrices.
 #pragma unroll
 
                     for (int wb = 0; wb < NUM_WARP_ITERS_PER_BLOCK; wb++)
                     {
                         my_A[wb] = (Vector_type)0.0;
+
+                        if ( wb * WARP_SIZE + lane_id < NxN )
+                        {
 #pragma unroll
 
-                        for ( int m = 0 ; m < N ; ++m )
-                        {
-                            my_A[wb] += my_s_A_mtx[N * idx[wb] + m] * my_s_B_mtx[N * m + idy[wb]];
+                            for ( int m = 0 ; m < N ; ++m )
+                            {
+                                my_A[wb] += my_s_A_mtx[N * idx[wb] + m] * my_s_B_mtx[N * m + idy[wb]];
+                            }
                         }
                     }
 
+                    // Finish all shared reads before replacing the first factor.
+                    utils::syncwarp();
 #pragma unroll
 
                     for (int wb = 0; wb < NUM_WARP_ITERS_PER_BLOCK; wb++)
@@ -238,6 +247,9 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
                         *my_s_A_ji = -1;
                     }
 
+                    // Publish both the product and the cleared search marker.
+                    utils::syncwarp();
+
                     // Run the loop.
                     b_col_it += lane_id;
                     int shared_found = utils::ballot( lane_id == 0 && uniform_a_col_id == -1 );
@@ -252,9 +264,11 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
                         }
 
                         shared_found = shared_found | utils::ballot(found);
-                        b_col_it += NxN;
+                        b_col_it += WARP_SIZE;
                     }
                     while ( __popc( shared_found ) == 0 && utils::any( b_col_it < b_col_end ) );
+
+                    utils::syncwarp();
 
                     // Load the blocks.
                     const int w_aji = *my_s_A_ji;
@@ -273,18 +287,26 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
                         my_s_B_mtx[wb * WARP_SIZE + lane_id] = my_C[wb];
                     }
 
+                    utils::syncwarp();
+
                     // Update e_out.
 #pragma unroll
 
                     for (int wb = 0; wb < NUM_WARP_ITERS_PER_BLOCK; wb++)
                     {
+                        if ( wb * WARP_SIZE + lane_id < NxN )
+                        {
 #pragma unroll
 
-                        for ( int m = 0 ; m < N ; ++m )
-                        {
-                            e_out[wb] -= my_s_A_mtx[N * idx[wb] + m] * my_s_B_mtx[N * m + idy[wb]];
+                            for ( int m = 0 ; m < N ; ++m )
+                            {
+                                e_out[wb] -= my_s_A_mtx[N * idx[wb] + m] * my_s_B_mtx[N * m + idy[wb]];
+                            }
                         }
                     }
+
+                    // All lanes must finish reading before the next block reuses shared memory.
+                    utils::syncwarp();
                 }
             } // a_col_begin < a_col_end
         } // current_color != 0
@@ -296,6 +318,8 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
         {
             my_s_B_mtx[wb * WARP_SIZE + lane_id] = my_s_A_mtx[wb * WARP_SIZE + lane_id] = e_out[wb];
         }
+
+        utils::syncwarp();
 
         // Invert the matrices.
 #pragma unroll
@@ -318,10 +342,11 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
                 my_s_A_mtx[N * row + lane_id] = my_s_B_mtx[N * row + lane_id] = my_s_B_mtx[N * row + lane_id] * diag;
             }
 
+            utils::syncwarp();
 #pragma unroll
 
             for (int wb = 0; wb < NUM_WARP_ITERS_PER_BLOCK; wb++)
-                if ( idx[wb] != row && idy[wb] != row)
+                if ( wb * WARP_SIZE + lane_id < NxN && idx[wb] != row && idy[wb] != row )
                 {
                     my_s_A_mtx[wb * WARP_SIZE + lane_id] = my_s_B_mtx[wb * WARP_SIZE + lane_id] - my_s_B_mtx[N * idx[wb] + row] * my_s_B_mtx[N * row + idy[wb]];
                 }
@@ -338,12 +363,16 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
                 my_s_A_mtx[N * lane_id + row] = tmp;
             }
 
+            // Complete the pivot update before copying A to the next iteration's input.
+            utils::syncwarp();
 #pragma unroll
 
             for (int wb = 0; wb < NUM_WARP_ITERS_PER_BLOCK; wb++)
             {
                 my_s_B_mtx[wb * WARP_SIZE + lane_id] = my_s_A_mtx[wb * WARP_SIZE + lane_id];
             }
+
+            utils::syncwarp();
         }
 
         // Store the results to Einv.
@@ -354,6 +383,8 @@ void DILU_setup_NxN_kernel_large( const int *__restrict A_rows,
                 {
                     Einv[NxN * a_row_id + wb * WARP_SIZE + lane_id] = my_s_A_mtx[wb * WARP_SIZE + lane_id];
                 }
+
+        utils::syncwarp();
     }
 }
 
@@ -1123,8 +1154,8 @@ void DILU_forward_NxN_kernel_large( const int *__restrict A_rows,
     const int NxN = N * N;
     // Number of rows computed per CTA.
     const int NUM_ITEMS_PER_CTA = NUM_WARPS_PER_CTA;
-    // Number of rows? per grid.
-    const int NUM_ITEMS_PER_GRID = CTA_SIZE;
+    // Number of rows per grid.
+    const int NUM_ITEMS_PER_GRID = gridDim.x * NUM_ITEMS_PER_CTA;
     // The coordinates of the thread inside the CTA/warp.
     const int warp_id = utils::warp_id();
     const int lane_id = utils::lane_id();
@@ -1217,18 +1248,19 @@ void DILU_forward_NxN_kernel_large( const int *__restrict A_rows,
             for ( int k = 0 ; k < WARP_SIZE ; k += blocks_per_warp )
             {
                 // id of the processed block by this thread
-                int my_k = k + lane_id_div_N;
-                // Load N blocks of X (if valid)
-                int uniform_a_col_id = utils::shfl( a_col_id, my_k );
-                int uniform_a_col_is_valid = utils::shfl( a_col_is_valid, my_k );
+                const int my_k = k + lane_id_div_N;
+                // All lanes join the shuffle, including lanes outside complete N-vectors.
+                const int source_lane = my_k < WARP_SIZE ? my_k : 0;
+                int uniform_a_col_id = utils::shfl( a_col_id, source_lane );
+                int uniform_a_col_is_valid = utils::shfl( a_col_is_valid, source_lane );
                 Vector_type my_x(0);
 
-                if ( uniform_a_col_id != -1 && lane_id < row_elems_per_warp)
+                if ( my_k < WARP_SIZE && lane_id < row_elems_per_warp && uniform_a_col_id != -1 )
                 {
                     my_x = __cachingLoad(&x[N * uniform_a_col_id + lane_id_mod_N]);
                 }
 
-                if ( uniform_a_col_id != -1 && uniform_a_col_is_valid && lane_id < row_elems_per_warp)
+                if ( my_k < WARP_SIZE && lane_id < row_elems_per_warp && uniform_a_col_id != -1 && uniform_a_col_is_valid )
                 {
                     my_x += delta[N * uniform_a_col_id + lane_id_mod_N];
                 }
@@ -1242,12 +1274,12 @@ void DILU_forward_NxN_kernel_large( const int *__restrict A_rows,
                     int uniform_a_col_tmp = a_col_begin + k + i, uniform_a_col_it = -1;
 
                     // check if we are going out of bounds/color
-                    if ( uniform_a_col_tmp < a_col_end )
+                    if ( k + i < WARP_SIZE && uniform_a_col_tmp < a_col_end )
                     {
                         uniform_a_col_it = uniform_a_col_tmp;
                     }
 
-                    if ( HAS_EXTERNAL_DIAG && uniform_a_col_tmp == a_col_end )
+                    if ( k + i < WARP_SIZE && HAS_EXTERNAL_DIAG && uniform_a_col_tmp == a_col_end )
                     {
                         uniform_a_col_it = A_diag[a_row_id];
                     }
@@ -1274,6 +1306,8 @@ void DILU_forward_NxN_kernel_large( const int *__restrict A_rows,
                 }
             } // Loop over k
         } // Loop over aColIt
+
+        utils::syncwarp();
 
         // Load Einvs.
         Vector_type my_Einv[NUM_WARP_ITERS_PER_BLOCK];
@@ -1306,6 +1340,9 @@ void DILU_forward_NxN_kernel_large( const int *__restrict A_rows,
                 }
             }
         }
+        // Finish reading the accumulator before shared memory is reused.
+        utils::syncwarp();
+
         // Update the diagonal term.
         int block_inside_id = lane_id;
 #pragma unroll
@@ -1315,6 +1352,8 @@ void DILU_forward_NxN_kernel_large( const int *__restrict A_rows,
             my_bmAx_s[block_inside_id] = my_Einv[j] * utils::shfl(my_bmAx, block_inside_id % N);
             block_inside_id += WARP_SIZE;
         }
+
+        utils::syncwarp();
 
         // Reduce bmAx terms.
         {
@@ -1337,6 +1376,7 @@ void DILU_forward_NxN_kernel_large( const int *__restrict A_rows,
         {
             delta[N * a_row_id + lane_id] = my_bmAx;
         }
+        utils::syncwarp();
     }
 }
 
@@ -2230,7 +2270,8 @@ void DILU_backward_NxN_kernel_large( const int *__restrict A_rows,
 #ifdef AMGX_ILU_COLORING
             int valid = false;
 
-            if ( a_col_tmp != -1 && current_color != 0 )
+            // Color zero also depends on higher colors in the backward sweep.
+            if ( a_col_tmp != -1 )
             {
                 if ( boundary_coloring == LAST )
                 {
@@ -2262,12 +2303,13 @@ void DILU_backward_NxN_kernel_large( const int *__restrict A_rows,
             for ( int k = 0 ; k < WARP_SIZE ; k += blocks_per_warp )
             {
                 // id of the processed block by this thread
-                int my_k = k + lane_id_div_N;
-                // Load N blocks of X (if valid)
-                int uniform_a_col_id = utils::shfl( a_col_id, my_k );
+                const int my_k = k + lane_id_div_N;
+                // All lanes join the shuffle, including lanes outside complete N-vectors.
+                const int source_lane = my_k < WARP_SIZE ? my_k : 0;
+                int uniform_a_col_id = utils::shfl( a_col_id, source_lane );
                 Vector_type my_x(0);
 
-                if ( uniform_a_col_id != -1 && lane_id < row_elems_per_warp)
+                if ( my_k < WARP_SIZE && lane_id < row_elems_per_warp && uniform_a_col_id != -1 )
                 {
                     my_x = Delta[N * uniform_a_col_id + lane_id_mod_N];
                 }
@@ -2282,7 +2324,7 @@ void DILU_backward_NxN_kernel_large( const int *__restrict A_rows,
                     int uniform_a_col_tmp = a_col_begin + k + i, uniform_a_col_it = -1;
 
                     // check if we are going out of bounds/color
-                    if ( uniform_a_col_tmp < a_col_end )
+                    if ( k + i < WARP_SIZE && uniform_a_col_tmp < a_col_end )
                     {
                         uniform_a_col_it = uniform_a_col_tmp;
                     }
@@ -2302,13 +2344,15 @@ void DILU_backward_NxN_kernel_large( const int *__restrict A_rows,
                                 my_val = A_vals[NxN * uniform_a_col_it + block_inside_id];
                             }
 
-                            my_delta_s[block_inside_id] -= my_val * utils::shfl(my_x, N * i + block_inside_id % N); //my_s_mem[N*i + block_inside_id % N]; // MOD IS SLOW!
+                            my_delta_s[block_inside_id] += my_val * utils::shfl(my_x, N * i + block_inside_id % N); //my_s_mem[N*i + block_inside_id % N]; // MOD IS SLOW!
                             block_inside_id += WARP_SIZE;
                         }
                     }
                 }
             } // Loop over k
         } // Loop over aColIt
+
+        utils::syncwarp();
 
         // Load Einvs.
         Vector_type my_Einv[NUM_WARP_ITERS_PER_BLOCK];
@@ -2342,6 +2386,9 @@ void DILU_backward_NxN_kernel_large( const int *__restrict A_rows,
             }
         }
 
+        // Finish reading the accumulator before shared memory is reused.
+        utils::syncwarp();
+
         // Update the diagonal term.
         if ( ROW_MAJOR )
         {
@@ -2354,6 +2401,8 @@ void DILU_backward_NxN_kernel_large( const int *__restrict A_rows,
                 block_inside_id += WARP_SIZE;
             }
         }
+
+        utils::syncwarp();
 
         // Reduce bmAx terms.
         {
@@ -2389,6 +2438,7 @@ void DILU_backward_NxN_kernel_large( const int *__restrict A_rows,
                 Delta[offset] = my_delta;
             }
         }
+        utils::syncwarp();
     }
 }
 
@@ -3305,6 +3355,26 @@ void DILU_forward_NxN_dispatch( const int *__restrict A_rows,
                 has_external_diag );
             break;
 
+        case 7:
+            DILU_forward_NxN_dispatch_large<Matrix_type, Vector_type, 7>(
+                A_rows,
+                A_cols,
+                A_vals,
+                A_diag,
+                x,
+                b,
+                delta,
+                sorted_rows_by_color,
+                num_rows_per_color,
+                current_color,
+                row_colors,
+                Einv,
+                boundary_coloring,
+                boundary_index,
+                row_major,
+                has_external_diag );
+            break;
+
         case 8:
             DILU_forward_NxN_dispatch_large<Matrix_type, Vector_type, 8>(
                 A_rows,
@@ -3610,6 +3680,25 @@ void DILU_backward_NxN_dispatch( const int *__restrict A_rows,
 
         case 5:
             DILU_backward_NxN_dispatch<Matrix_type, Vector_type, WeightType, 5>(
+                A_rows,
+                A_cols,
+                A_vals,
+                x,
+                weight,
+                sorted_rows_by_color,
+                row_colors,
+                Einv,
+                delta,
+                Delta,
+                num_rows_per_color,
+                current_color,
+                boundary_coloring,
+                boundary_index,
+                row_major );
+            break;
+
+        case 7:
+            DILU_backward_NxN_dispatch_large<Matrix_type, Vector_type, WeightType, 7, 2>(
                 A_rows,
                 A_cols,
                 A_vals,
@@ -3984,6 +4073,19 @@ void MulticolorDILUSolver<TemplateConfig<AMGX_device, V, M, I> >::computeEinv_Nx
                     i );
                 break;
 
+            case 7:
+                DILU_setup_NxN_kernel_large<ValueTypeA, ValueTypeB, 7, CTA_SIZE, 32, 2> <<< GRID_SIZE, CTA_SIZE, 0, stream>>>(
+                    A.row_offsets.raw(),
+                    A.col_indices.raw(),
+                    A.diag.raw(),
+                    A.values.raw(),
+                    this->Einv.raw(),
+                    A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,
+                    A.getMatrixColoring().getRowColors().raw(),
+                    num_rows_per_color,
+                    i );
+                break;
+
             case 8:
                 DILU_setup_NxN_kernel_large<ValueTypeA, ValueTypeB, 8, CTA_SIZE, 32, 2> <<< GRID_SIZE, CTA_SIZE, 0, stream>>>(
                     A.row_offsets.raw(),
@@ -4186,6 +4288,16 @@ void MulticolorDILUSolver<TemplateConfig<AMGX_device, V, M, I> >::smooth_NxN( co
 
                 case 5:
                     DILU_backward_NxN_kernel_skip<ValueTypeA, ValueTypeB, WeightType, 5, CTA_SIZE> <<< GRID_SIZE, CTA_SIZE>>>(
+                        x.raw(),
+                        this->weight,
+                        A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,
+                        this->m_delta.raw(),
+                        this->m_Delta.raw(),
+                        num_rows_per_color );
+                    break;
+
+                case 7:
+                    DILU_backward_NxN_kernel_skip<ValueTypeA, ValueTypeB, WeightType, 7, CTA_SIZE> <<< GRID_SIZE, CTA_SIZE>>>(
                         x.raw(),
                         this->weight,
                         A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,

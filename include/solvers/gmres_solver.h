@@ -82,6 +82,13 @@ class GMRES_Solver : public Solver<T_Config>
                                        : MONITORED_RESIDUAL_ARNOLDI_ESTIMATE;
         }
 
+        bool is_current_solution_available(AMGX_STATUS status) const
+        {
+            return m_R == 1 || this->is_last_iter() || isDone(status)
+                   || (m_reliable_residual ? m_cycle_iteration == 0
+                       : this->m_curr_iter % m_R == m_R - 1);
+        }
+
         // Initialize the solver before running the iterations.
         void solve_init( VVector &b, VVector &x, bool xIsZero );
         // Run a single iteration. Compute the residual and its norm and decide convergence.

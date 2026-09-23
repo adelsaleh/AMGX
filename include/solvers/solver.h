@@ -161,6 +161,10 @@ class Solver : public AuxData
         virtual void solve_init( VVector &b, VVector &x, bool xIsZero ) {}
         // Run a single iteration. Compute the residual and its norm and decide convergence.
         virtual AMGX_STATUS solve_iteration( VVector &b, VVector &x, bool xIsZero ) = 0;
+        // Restarted Krylov methods may defer forming x until a cycle ends.
+        // Finite divergence must be verified against the current iterate.
+        virtual bool is_current_solution_available(AMGX_STATUS status) const { return true; }
+
         // Finalize the solver after running the iterations.
         virtual void solve_finalize( VVector &b, VVector &x ) {}
 

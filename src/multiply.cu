@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <multiply.h>
+#include <classical/hierarchy_diagnostics.h>
 #include <basic_types.h>
 #include <texture.h>
 #include <util.h>
@@ -89,6 +90,7 @@ void multiply_block_size(Matrix<TConfig> &A, Vector<TConfig> &B, Vector<TConfig>
 template <typename TConfig>
 void multiply(Matrix<TConfig> &A, Vector<TConfig> &B, Vector<TConfig> &C, ViewType view)
 {
+    classical::HierarchyProductProbe hierarchy_product_probe(A);
     typedef Matrix<TConfig> TMatrix;
     typedef Vector<TConfig> TVector;
 

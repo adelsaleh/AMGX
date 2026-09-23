@@ -42,7 +42,9 @@ public:
                                       bool right_normalize,
                                       double pivot_tolerance,
                                       double constraint_tolerance,
-                                      Matrix<TConfig> &block_transfer);
+                                      Matrix<TConfig> &block_transfer,
+                                      const Vector<typename TConfig::template setVecPrec<AMGX_vecInt>::Type> *cf_map = NULL,
+                                      bool constant_vector = false);
     static void extended_i_dense_transfer(
         const Matrix<TConfig> &A,
         const Matrix<TConfig> &scalar_transfer,
@@ -91,7 +93,9 @@ public:
                                       bool right_normalize,
                                       double pivot_tolerance,
                                       double constraint_tolerance,
-                                      Matrix<TConfig> &block_transfer);
+                                      Matrix<TConfig> &block_transfer,
+                                      const Vector<typename TConfig::template setVecPrec<AMGX_vecInt>::Type> *cf_map = NULL,
+                                      bool constant_vector = false);
     static void extended_i_dense_transfer(
         const Matrix<TConfig> &A,
         const Matrix<TConfig> &scalar_transfer,

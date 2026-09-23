@@ -555,7 +555,8 @@ __global__ void smooth_dense_transfer_values_kernel(
     const ValueType *A_values, IndexType num_rows, int block_dim,
     bool row_major, const IndexType *P_row_offsets,
     const IndexType *P_col_indices, const ValueType *P_values,
-    const ValueType *inverse_diagonal,
+    const ValueType *inverse_diagonal, const int *cf_map,
+    bool constant_vector,
     typename types::PODTypes<ValueType>::type smoothing_weight,
     ValueType *smoothed_P_values)
 {
@@ -577,6 +578,19 @@ __global__ void smooth_dense_transfer_values_kernel(
             const int local_row = logical / block_dim;
             const int local_col = logical % block_dim;
             const IndexType coarse_col = P_col_indices[P_entry];
+            if (constant_vector && cf_map[row] >= 0)
+            {
+                // Exact coarse-point injection keeps P full column rank.
+                // Preserving only P*1=1 would not enforce this by itself.
+                smoothed_P_values[
+                    static_cast<size_t>(P_entry) * block_size
+                    + dense_block_offset<ValueType>(
+                        local_row, local_col, block_dim, row_major)] =
+                    coarse_col == cf_map[row] && local_row == local_col
+                    ? types::util<ValueType>::get_one()
+                    : types::util<ValueType>::get_zero();
+                continue;
+            }
             ValueType diagonal_correction =
                 types::util<ValueType>::get_zero();
 
@@ -850,7 +864,7 @@ __global__ void copy_dense_transfer_values_kernel(
 template <typename IndexType, typename ValueType>
 __global__ void compute_dense_row_correction_kernel(
     const IndexType *P_row_offsets, const ValueType *block_P_values,
-    IndexType num_rows, int block_dim, bool row_major,
+    IndexType num_rows, int block_dim, bool row_major, bool constant_vector,
     ValueType *row_correction)
 {
     const int block_size = block_dim * block_dim;
@@ -871,17 +885,28 @@ __global__ void compute_dense_row_correction_kernel(
         for (IndexType entry = P_row_offsets[row];
              entry < P_row_offsets[row + 1]; ++entry)
         {
-            row_sum +=
-                block_P_values[static_cast<size_t>(entry) * block_size
-                               + dense_block_offset<ValueType>(
-                                   local_row, local_col, block_dim, row_major)];
+            const int begin_col = constant_vector ? 0 : local_col;
+            const int end_col = constant_vector ? block_dim : local_col + 1;
+            for (int col = begin_col; col < end_col; ++col)
+            {
+                row_sum +=
+                    block_P_values[static_cast<size_t>(entry) * block_size
+                                   + dense_block_offset<ValueType>(
+                                       local_row, col, block_dim, row_major)];
+            }
         }
 
         const ValueType target =
-            local_row == local_col
+            constant_vector || local_row == local_col
             ? types::util<ValueType>::get_one()
             : types::util<ValueType>::get_zero();
-        row_correction[correction] = target - row_sum;
+        // Scalar Poisson in nodal coordinates needs only sum_c P_ic * 1 = 1.
+        // Distribute its defect equally over block columns. The application
+        // kernel distributes it over coarse neighbors with normalized weights.
+        typedef typename types::PODTypes<ValueType>::type PodType;
+        row_correction[correction] = constant_vector
+            ? (target - row_sum) / static_cast<PodType>(block_dim)
+            : target - row_sum;
     }
 }
 
@@ -1117,7 +1142,7 @@ __global__ void right_normalize_dense_transfer_kernel(
 template <typename IndexType, typename ValueType>
 __global__ void validate_dense_row_constraint_kernel(
     const IndexType *P_row_offsets, const ValueType *block_P_values,
-    IndexType num_rows, int block_dim, bool row_major,
+    IndexType num_rows, int block_dim, bool row_major, bool constant_vector,
     typename types::PODTypes<ValueType>::type tolerance, int *invalid)
 {
     const int block_size = block_dim * block_dim;
@@ -1138,18 +1163,23 @@ __global__ void validate_dense_row_constraint_kernel(
         for (IndexType entry = P_row_offsets[row];
              entry < P_row_offsets[row + 1]; ++entry)
         {
-            row_sum +=
-                block_P_values[static_cast<size_t>(entry) * block_size
-                               + dense_block_offset<ValueType>(
-                                   local_row, local_col, block_dim, row_major)];
+            const int begin_col = constant_vector ? 0 : local_col;
+            const int end_col = constant_vector ? block_dim : local_col + 1;
+            for (int col = begin_col; col < end_col; ++col)
+            {
+                row_sum +=
+                    block_P_values[static_cast<size_t>(entry) * block_size
+                                   + dense_block_offset<ValueType>(
+                                       local_row, col, block_dim, row_major)];
+            }
         }
 
         const ValueType target =
-            local_row == local_col
+            constant_vector || local_row == local_col
             ? types::util<ValueType>::get_one()
             : types::util<ValueType>::get_zero();
 
-        if (types::util<ValueType>::abs(row_sum - target) > tolerance)
+        if (!(types::util<ValueType>::abs(row_sum - target) <= tolerance))
         {
             if (atomicCAS(invalid, 0, 1) == 0)
             {
@@ -1451,7 +1481,8 @@ void Block_Graph_Ops<TemplateConfig<AMGX_host, V, M, I> >::multiply_identity_tra
 template <AMGX_VecPrecision V, AMGX_MatPrecision M, AMGX_IndPrecision I>
 void Block_Graph_Ops<TemplateConfig<AMGX_host, V, M, I> >::smooth_dense_transfer(
     const Matrix<TConfig> &, const Matrix<TConfig> &, double, int, bool,
-    double, double, Matrix<TConfig> &)
+    double, double, Matrix<TConfig> &,
+    const Vector<typename TConfig::template setVecPrec<AMGX_vecInt>::Type> *, bool)
 {
     FatalError("Classical dense block-graph BSR hierarchy is device-only",
                AMGX_ERR_NOT_IMPLEMENTED);
@@ -1821,7 +1852,9 @@ void Block_Graph_Ops<TemplateConfig<AMGX_device, V, M, I> >::smooth_dense_transf
     const Matrix<TConfig> &A, const Matrix<TConfig> &scalar_transfer,
     double smoothing_weight, int smoothing_steps, bool right_normalize,
     double pivot_tolerance, double constraint_tolerance,
-    Matrix<TConfig> &block_transfer)
+    Matrix<TConfig> &block_transfer,
+    const Vector<typename TConfig::template setVecPrec<AMGX_vecInt>::Type> *cf_map,
+    bool constant_vector)
 {
     typedef typename Matrix<TConfig>::index_type IndexType;
     typedef typename Matrix<TConfig>::value_type ValueType;
@@ -1834,6 +1867,13 @@ void Block_Graph_Ops<TemplateConfig<AMGX_device, V, M, I> >::smooth_dense_transf
             || scalar_transfer.get_num_rows() != A.get_num_rows())
     {
         FatalError("Invalid matrices for dense block-graph interpolation",
+                   AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    if (constant_vector && (right_normalize || cf_map == NULL
+            || cf_map->size() < static_cast<size_t>(A.get_num_rows())))
+    {
+        FatalError("Constant-vector interpolation requires an additive correction and coarse-point map",
                    AMGX_ERR_BAD_PARAMETERS);
     }
 
@@ -1947,6 +1987,7 @@ void Block_Graph_Ops<TemplateConfig<AMGX_device, V, M, I> >::smooth_dense_transf
                     scalar_transfer.col_indices.raw(),
                     block_transfer.values.raw(),
                     amgx::thrust::raw_pointer_cast(inverse_diagonal.data()),
+                    constant_vector ? cf_map->raw() : NULL, constant_vector,
                     static_cast<PodType>(smoothing_weight), smoothed);
             cudaCheckError();
 
@@ -1986,7 +2027,7 @@ void Block_Graph_Ops<TemplateConfig<AMGX_device, V, M, I> >::smooth_dense_transf
                     correction_blocks, threads, 0,
                     amgx::thrust::global_thread_handle::get_stream()>>>(
                         scalar_transfer.row_offsets.raw(), smoothed,
-                        A.get_num_rows(), block_dim, row_major,
+                        A.get_num_rows(), block_dim, row_major, constant_vector,
                         amgx::thrust::raw_pointer_cast(diagonal_work.data()));
                 cudaCheckError();
 
@@ -2016,7 +2057,7 @@ void Block_Graph_Ops<TemplateConfig<AMGX_device, V, M, I> >::smooth_dense_transf
             amgx::thrust::global_thread_handle::get_stream()>>>(
                 scalar_transfer.row_offsets.raw(),
                 block_transfer.values.raw(), A.get_num_rows(), block_dim,
-                row_major, effective_constraint_tolerance,
+                row_major, constant_vector, effective_constraint_tolerance,
                 amgx::thrust::raw_pointer_cast(invalid_constraint.data()));
         cudaCheckError();
 
@@ -2177,7 +2218,7 @@ void Block_Graph_Ops<TemplateConfig<AMGX_device, V, M, I> >::extended_i_dense_tr
             amgx::thrust::global_thread_handle::get_stream()>>>(
                 scalar_transfer.row_offsets.raw(),
                 amgx::thrust::raw_pointer_cast(scaled_values.data()),
-                A.get_num_rows(), block_dim, row_major,
+                A.get_num_rows(), block_dim, row_major, false,
                 amgx::thrust::raw_pointer_cast(diagonal_work.data()));
         cudaCheckError();
         apply_dense_row_correction_kernel<<<
@@ -2202,7 +2243,7 @@ void Block_Graph_Ops<TemplateConfig<AMGX_device, V, M, I> >::extended_i_dense_tr
             amgx::thrust::global_thread_handle::get_stream()>>>(
                 scalar_transfer.row_offsets.raw(),
                 block_transfer.values.raw(), A.get_num_rows(), block_dim,
-                row_major, effective_constraint_tolerance,
+                row_major, false, effective_constraint_tolerance,
                 amgx::thrust::raw_pointer_cast(invalid_constraint.data()));
         cudaCheckError();
 

@@ -405,6 +405,7 @@ inline void registerParameters()
     AMG_Config::registerParameter<double>("relaxation_factor", "the relaxation factor used in a solver", 0.9, 0.0, 2.0);
     AMG_Config::registerParameter<int>("jacobi_l1_scalar_rows_for_blocks", "treat each scalar row of a BSR matrix exactly as scalar CSR in JACOBI_L1 <0|1>", 0, 0, 1);
     AMG_Config::registerParameter<int>("block_jacobi_use_fused_small_blocks", "Use fused residual/update kernels for 2x2 and 3x3 blocks and a subgroup-per-row kernel for 5x5 device block Jacobi <0|1>", 0, bool_flag_values);
+    AMG_Config::registerParameter<int>("block_jacobi_zero_start_fastpath", "Apply w*Dinv*b directly for a zero-start single-GPU device block Jacobi correction with block size >5 <0|1>", 0, bool_flag_values);
     std::vector<std::string> bsr_spmv_backend_values;
     bsr_spmv_backend_values.push_back("legacy");
     bsr_spmv_backend_values.push_back("cusparse_generic");
@@ -428,7 +429,8 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("kpz_order", "the order of the KPZ polynomial smoother", 3);
     //Chebyshev polynomial smoother
     AMG_Config::registerParameter<int>("chebyshev_polynomial_order", "the order of the KPZ polynomial smoother", 5);
-    AMG_Config::registerParameter<int>("chebyshev_lambda_estimate_mode", "the order of the KPZ polynomial smoother", 0, 0, 2);
+    AMG_Config::registerParameter<int>("chebyshev_reuse_initial_preconditioner", "Reuse solve_init correction in the first Chebyshev stage; requires a fixed preconditioner <0|1>", 0, bool_flag_values);
+    AMG_Config::registerParameter<int>("chebyshev_lambda_estimate_mode", "Chebyshev spectrum: 0=eigen min/max, 1=eigen max, 2=row bound, 3=user bounds, 4=SPD weighted power", 0, 0, 4);
     AMG_Config::registerParameter<double>("cheby_max_lambda", "User guess at maximum eigenvalue of preconditioned operator", 1.0, 0.0, 1.0e20);
     AMG_Config::registerParameter<double>("cheby_min_lambda", "User guess at minimum eigenvalue of preconditioned operator", 0.125, 0.0, 1.0e20);
     //Kaczmarz
@@ -470,6 +472,9 @@ inline void registerParameters()
     AMG_Config::registerParameter<std::string>("coarseAgenerator_coarse", "the method used to compute the Galerkin product in Agg-AMG  for coarser levels <LOW_DEG|THRUST|HYBRID>", "LOW_DEG", coarse_gen_values);
     //Classical (Interpolators)
     AMG_Config::registerParameter<std::string>(
+        "classical_hierarchy_export_prefix",
+        "Lossless classical P/R/coarse-A export path prefix; empty disables diagnostics", "");
+    AMG_Config::registerParameter<std::string>(
         "classical_bsr_hierarchy",
         "classical AMG hierarchy for block matrices "
         "<scalar_expand|block_graph_identity|block_graph_dense>",
@@ -510,9 +515,10 @@ inline void registerParameters()
     std::vector<std::string> block_graph_dense_constraint_modes;
     block_graph_dense_constraint_modes.push_back("additive");
     block_graph_dense_constraint_modes.push_back("right_normalize");
+    block_graph_dense_constraint_modes.push_back("constant_vector");
     AMG_Config::registerParameter<std::string>(
         "block_graph_dense_constraint_mode",
-        "block constant-mode enforcement <additive|right_normalize>",
+        "interpolation constraint <additive|right_normalize|constant_vector (nodal scalar Poisson)>",
         "additive", block_graph_dense_constraint_modes);
     AMG_Config::registerParameter<double>(
         "block_graph_dense_pivot_tolerance",
@@ -520,7 +526,7 @@ inline void registerParameters()
         1.0e-12);
     AMG_Config::registerParameter<double>(
         "block_graph_dense_constraint_tolerance",
-        "absolute validation tolerance for sum_c P_ic = I_b <1e-8>",
+        "absolute validation tolerance for block identity or constant-vector reproduction <1e-8>",
         1.0e-8);
     AMG_Config::registerParameter<std::string>("interpolator", "the interpolation algorithm <D1|D2|MULTIPASS>", "D1", getAllInterpolators());
     //Energymin (Interpolators)
@@ -599,7 +605,9 @@ inline void registerParameters()
     AMG_Config::registerParameter<int>("use_scalar_norm", "a flag that allows to use a scalar norm (as opposed to block norms) when dealing with block matrices (0: use block norm, 1: force use of scalar norm) <0>", 0);
     AMG_Config::registerParameter<double>("tolerance", "the convergence tolerance", 1e-12);
     AMG_Config::registerParameter<double>("alt_rel_tolerance", "alternative convergence relative tolerance for combined criteria", 1e-12);
-    AMG_Config::registerParameter<double>("rel_div_tolerance", "relative tolerance for divergence checks (-1: disabled)", -1);
+    AMG_Config::registerParameter<double>("rel_div_tolerance", "maximum growth over best monitored residual, with an initial-residual roundoff floor (-1: disabled)", -1);
+    AMG_Config::registerParameter<int>("divergence_patience", "consecutive excessive completed iterations before a true residual check", 5, 1, std::numeric_limits<int>::max());
+    AMG_Config::registerParameter<int>("divergence_grace_iters", "startup iterations exempt from finite residual growth checks", 10, 0, std::numeric_limits<int>::max());
     //Register Statistics and Reporting Parameters
     AMG_Config::registerParameter<int>("verbosity_level", "verbosity level for output, 3 - custom print-outs <0|1|2|3>", 3);
     AMG_Config::registerParameter<int>("solver_verbose", "The solver will print information about its parameters, <0|1>", 0);

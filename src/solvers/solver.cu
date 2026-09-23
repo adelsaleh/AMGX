@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <solvers/solver.h>
+#include <convergence/residual_divergence.h>
 #include <scalers/scaler.h>
 #include <assert.h>
 #include <blas.h>
@@ -715,14 +716,14 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
                 "print_solve_stats_interval", this->m_cfg_scope));
     const auto display_norm = [](const PODVector_h &values) -> PODValueB
     {
-        PODValueB squared = types::util<PODValueB>::get_zero();
+        PODValueB norm = types::util<PODValueB>::get_zero();
 
         for (int i = 0; i < static_cast<int>(values.size()); ++i)
         {
-            squared += values[i] * values[i];
+            norm = std::hypot(norm, values[i]);
         }
 
-        return std::sqrt(squared);
+        return norm;
     };
     AMGX_CPU_PROFILER("Solver::solve ");
 
@@ -936,6 +937,17 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
         amgx_output(ss.str().c_str(), static_cast<int>(ss.str().length()));
     }
 
+    const double divergence_factor = this->m_cfg->AMG_Config::template getParameter<double>(
+            "rel_div_tolerance", this->m_cfg_scope);
+    if (!std::isfinite(divergence_factor) || (divergence_factor > 0.0 && divergence_factor <= 1.0))
+        FatalError("rel_div_tolerance must exceed one or be nonpositive to disable", AMGX_ERR_BAD_PARAMETERS);
+    ResidualDivergenceGuard divergence_guard(
+            m_monitor_convergence ? divergence_factor : -1.0,
+            this->m_cfg->AMG_Config::template getParameter<int>("divergence_patience", this->m_cfg_scope),
+            this->m_cfg->AMG_Config::template getParameter<int>("divergence_grace_iters", this->m_cfg_scope),
+            m_monitor_convergence ? display_norm(m_nrm_ini) : 0.0,
+            std::numeric_limits<PODValueB>::epsilon());
+
     // Initialize convergence checker if needed.
     if (m_monitor_convergence)
     {
@@ -944,7 +956,10 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
     }
 
     // Initialize the solver
-    bool done = m_monitor_convergence ? (converged() == AMGX_ST_CONVERGED) : false;
+    const bool nonfinite_initial = divergence_guard.enabled() && !std::isfinite(display_norm(m_nrm_ini));
+    bool done = nonfinite_initial || (m_monitor_convergence && converged() == AMGX_ST_CONVERGED);
+    if (nonfinite_initial && getPrintSolveStats())
+        amgx_printf("  early exit: non-finite initial residual\n");
 
     if (m_max_iters == 0)
     {
@@ -956,7 +971,8 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
         solve_init(b, x, xIsZero);
     }
 
-    AMGX_STATUS conv_stat = done ? AMGX_ST_CONVERGED : AMGX_ST_NOT_CONVERGED;
+    AMGX_STATUS conv_stat = nonfinite_initial ? AMGX_ST_DIVERGED
+                           : done ? AMGX_ST_CONVERGED : AMGX_ST_NOT_CONVERGED;
 
     // Run the iterations
     std::stringstream ss;
@@ -967,6 +983,33 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
         conv_stat = solve_iteration(b, x, xIsZero);
         // Make sure x is not zero anymore.
         xIsZero = false;
+        // A scalar history check is cheap; allocate scratch and apply A only
+        // on suspected divergence. Never overwrite a live Krylov recurrence.
+        const double monitored = divergence_guard.enabled() ? display_norm(m_nrm) : 0.0;
+        if (divergence_guard.observe(monitored, m_curr_iter + 1)
+            && (!std::isfinite(monitored) || is_current_solution_available(conv_stat)))
+        {
+            VVector true_residual(b);
+            true_residual.tag = this->tag * 100 + 99;
+            true_residual.dirtybit = 1;
+            PODVector_h true_norm(m_nrm);
+            compute_residual(b, x, true_residual);
+            compute_norm(true_residual, true_norm);
+            const double verified = display_norm(true_norm);
+            // Non-finite recurrence arithmetic is terminal even if a restarted
+            // method still has a finite solution from the previous cycle.
+            if (!std::isfinite(monitored) || divergence_guard.excessive(verified))
+            {
+                conv_stat = AMGX_ST_DIVERGED;
+                m_nrm = true_norm;
+                if (getPrintSolveStats())
+                    amgx_printf("  early exit: %s at iteration %d; monitored=%.6e, "
+                                "explicit b-A*x=%.6e, best monitored=%.6e\n",
+                                !std::isfinite(monitored) ? "non-finite residual" : "confirmed residual growth",
+                                m_curr_iter + 1, monitored, verified, divergence_guard.best());
+            }
+            else divergence_guard.unconfirmed();
+        }
         // Is it done ?
         done = m_monitor_convergence && isDone(conv_stat);
 
@@ -977,7 +1020,7 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
             const float held_gib = MemoryInfo::getReservedMemoryUsage();
             solve_peak_used_gib = std::max(solve_peak_used_gib, used_gib);
             solve_peak_held_gib = std::max(solve_peak_held_gib, held_gib);
-            if (m_curr_iter % print_solve_stats_interval == 0 || done)
+            if (m_curr_iter % print_solve_stats_interval == 0 || done || is_last_iter())
             {
                 const PODValueB current_display_norm = display_norm(m_nrm);
                 const PODValueB initial_display_norm = display_norm(m_nrm_ini);

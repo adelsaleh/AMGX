@@ -80,6 +80,10 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
         if (level->isInitCycle())
         {
             xIsZero = true;
+            // A zero-initial-guess flag initializes the residual, but a
+            // smoother may update x additively. Coarse correction buffers
+            // survive previous cycles, so clear them before any pre-sweeps.
+            fill(x, types::util<ValueType>::get_zero());
         }
 
         *smoothing_direction = 0;
@@ -114,10 +118,6 @@ void FixedCycle<T_Config, CycleDispatcher>::cycle( AMG_Class *amg, AMG_Level<T_C
                 smoother->setTolerance( 0.);
                 smoother->set_max_iters( n_presweeps );
                 smoother->solve( b, x, xIsZero );
-            }
-            else if ( xIsZero )
-            {
-                fill( x, types::util<ValueType>::get_zero());
             }
 
             level->unsetInitCycle();

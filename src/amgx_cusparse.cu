@@ -804,14 +804,45 @@ void Cusparse::bsrmv_internal( const typename TConfig::VecPrec alphaConst,
                                const cudaStream_t &stream)
 {
     typedef typename TConfig::VecPrec ValueType;
-    int rowOff, nrows, nnz;
+    int rowOff, nrows;
     A.getOffsetAndSizeForView(view, &rowOff, &nrows);
-    A.getNnzForView(view, &nnz);
 
     cusparseDirection_t direction = A.getBlockFormat() == ROW_MAJOR ? CUSPARSE_DIRECTION_ROW : CUSPARSE_DIRECTION_COLUMN;
 
+    // E contains one block per row (e.g. block-Jacobi's Dinv), not A's
+    // off-diagonal sparsity. Honor the same backend as the full-matrix multiply.
+#if CUDART_VERSION >= 13000
+    if constexpr (TConfig::memSpace == AMGX_device
+                  && std::is_same<typename TConfig::MatPrec,
+                                  typename TConfig::VecPrec>::value
+                  && (std::is_same<typename TConfig::MatPrec, float>::value
+                      || std::is_same<typename TConfig::MatPrec, double>::value))
+    {
+        const bool complete_view = rowOff == 0
+                                   && nrows == static_cast<int>(A.row_offsets.size()) - 1;
+        if (A.template getParameter<int>("bsr_spmv_backend") == 1 && complete_view
+            && A.get_block_dimx() == A.get_block_dimy()
+            && A.get_block_dimx() > 1)
+        {
+            const cudaDataType value_type = std::is_same<ValueType, double>::value
+                                            ? CUDA_R_64F : CUDA_R_32F;
+            const cusparseOrder_t block_order = A.getBlockFormat() == ROW_MAJOR
+                                                ? CUSPARSE_ORDER_ROW
+                                                : CUSPARSE_ORDER_COL;
+            cusparseCheckError(cusparseSetStream(Cusparse::get_instance().m_handle, stream));
+            generic_BSR_SpMV(
+                Cusparse::get_instance().m_handle, nrows, A.get_num_cols(), nrows,
+                A.get_block_dimx(), &alphaConst, E.raw(), A.m_seq_offsets.raw(),
+                A.m_seq_offsets.raw(), x.raw(), &betaConst, y.raw(),
+                value_type, block_order, stream);
+            cusparseCheckError(cusparseSetStream(Cusparse::get_instance().m_handle, 0));
+            return;
+        }
+    }
+#endif
+
     bsrmv( Cusparse::get_instance().m_handle, direction, CUSPARSE_OPERATION_NON_TRANSPOSE,
-           nrows, A.get_num_cols(), nnz, &alphaConst,
+           nrows, A.get_num_cols(), A.get_num_rows(), &alphaConst,
            A.cuMatDescr,
            E.raw(),
            A.m_seq_offsets.raw(),

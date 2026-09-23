@@ -38,6 +38,7 @@ class BlockJacobiSolver_Base : public Solver<T_Config>
     protected:
         double weight;
         bool use_fused_small_blocks;
+        bool zero_start_fastpath;
         int bsr_spmv_backend;
         MVector Dinv;
 
@@ -144,7 +145,7 @@ class BlockJacobiSolver< TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_ind
         void computeDinv_4x4(const Matrix_d &A);
         void computeDinv_3x3(const Matrix_d &A);
         void computeDinv_Big(const Matrix_d &A, const int bsize);
-        void smooth_BxB(Matrix_d &A, VVector &b, VVector &x, bool firstStep, ViewType separation_flags); // first step is false when smoothing second step (exterior-interior) view in latency hiding
+        void smooth_BxB(Matrix_d &A, VVector &b, VVector &x, bool xIsZero, ViewType separation_flags);
         void find_diag( const Matrix_d &A );
 
 };
