@@ -888,9 +888,10 @@ Greedy_Recolor_MatrixColoring<TemplateConfig<AMGX_device, V, M, I> >::color_matr
         int num_uncolored = num_rows;
         int i = 0;
 #if DISCARD_COLORED
-        device_vector_alloc<int> color_in(num_rows);
+        // Use the same storage interface as m_row_colors for allocation swaps.
+        IVector color_in(num_rows);
 #else
-        device_vector_alloc<int> color_in;
+        IVector color_in;
 #endif
 #if USE_GTLT
         device_vector_alloc<unsigned long long int> gtlt(num_rows);

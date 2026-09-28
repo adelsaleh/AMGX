@@ -27,6 +27,7 @@
 #include "util.h"
 #include "reorder_partition.h"
 #include <algorithm>
+#include <climits>
 #include <solvers/solver.h>
 #include <matrix.h>
 #include <vector.h>
@@ -705,7 +706,14 @@ inline AMGX_ERROR set_solver_with_shared(AMGX_solver_handle slv,
 
     cudaSetDevice(solver.getResources()->getDevice(0));
     cudaCheckError();
-    return (solver.*memf)(wrapA.wrapped());
+    struct Completion {
+        bool borrowed;
+        ~Completion() { if (borrowed) cudaStreamSynchronize(cudaStreamLegacy); }
+    } completion{A.values.is_borrowed()};
+    AMGX_ERROR result = (solver.*memf)(wrapA.wrapped());
+    if (completion.borrowed && cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess)
+        return AMGX_ERR_CUDA_FAILURE;
+    return result;
 }
 
 template<AMGX_Mode CASE,
@@ -747,7 +755,15 @@ inline AMGX_ERROR solve_with(AMGX_solver_handle slv,
 
     cudaSetDevice(solver.getResources()->getDevice(0));
     cudaCheckError();
+    const bool borrowed = b.is_borrowed() || x.is_borrowed() ||
+        solver.uses_borrowed_matrix();
+    struct Completion {
+        bool borrowed;
+        ~Completion() { if (borrowed) cudaStreamSynchronize(cudaStreamLegacy); }
+    } completion{borrowed};
     AMGX_ERROR ret = solver.solve(b, x, wrapSolver.last_solve_status(), xIsZero);
+    if (borrowed && cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess && ret == AMGX_OK)
+        ret = AMGX_ERR_CUDA_FAILURE;
     return ret;
 }
 
@@ -796,6 +812,8 @@ inline AMGX_ERROR matrix_vector_multiply(AMGX_matrix_handle mtx,
         v_x.dirtybit = 0;
     }*/
     multiply(A, v_x, v_rhs);
+    if (A.values.is_borrowed() && cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess)
+        return AMGX_ERR_CUDA_FAILURE;
     return AMGX_OK;
 }
 
@@ -874,6 +892,7 @@ inline AMGX_RC matrix_upload_all(AMGX_matrix_handle mtx,
         //FatalError("Error: Failure in matrix_upload_all().\n", AMGX_ERR_BAD_PARAMETERS);
         typedef typename MatPrecisionMap<AMGX_GET_MODE_VAL(AMGX_MatPrecision, CASE)>::Type ValueType;
 
+    if (A.values.is_borrowed()) return AMGX_RC_BAD_PARAMETERS;
     A.set_initialized(0);
     cudaSetDevice(A.getResources()->getDevice(0));
     cudaCheckError();
@@ -933,6 +952,7 @@ inline AMGX_RC matrix_replace_coefficients(AMGX_matrix_handle mtx,
     typedef CWrapHandle<AMGX_matrix_handle, MatrixLetterT> MatrixW;
     MatrixW wrapA(mtx);
     MatrixLetterT &A = *wrapA.wrapped();
+    if (A.values.is_borrowed()) return AMGX_RC_BAD_PARAMETERS;
     cudaSetDevice(A.getResources()->getDevice(0));
     cudaCheckError();
     typedef typename MatPrecisionMap<AMGX_GET_MODE_VAL(AMGX_MatPrecision, CASE)>::Type ValueType;
@@ -1063,6 +1083,7 @@ inline AMGX_RC matrix_sort(AMGX_matrix_handle mtx)
 {
     typedef Matrix<typename TemplateMode<CASE>::Type> MatrixLetterT;
     MatrixLetterT &A = *get_mode_object_from<CASE, Matrix, AMGX_matrix_handle>(mtx);
+    if (A.values.is_borrowed()) return AMGX_RC_BAD_PARAMETERS;
     cudaSetDevice(A.getResources()->getDevice(0));
     cudaCheckError();
 
@@ -1077,6 +1098,9 @@ inline AMGX_RC matrix_sort(AMGX_matrix_handle mtx)
     }
 }
 
+#include "borrowed_vector_api.h"
+#include "borrowed_matrix_api.h"
+
 template<AMGX_Mode CASE>
 inline AMGX_RC vector_upload(AMGX_vector_handle vec,
                              int n,
@@ -1088,6 +1112,7 @@ inline AMGX_RC vector_upload(AMGX_vector_handle vec,
     typedef typename VecPrecisionMap<AMGX_GET_MODE_VAL(AMGX_VecPrecision, CASE)>::Type ValueTypeB;
     VectorW wrapV(vec);
     VectorLetterT &v = *wrapV.wrapped();
+    if (v.is_borrowed()) return AMGX_RC_BAD_PARAMETERS;
     cudaSetDevice(v.getResources()->getDevice(0));
     cudaCheckError();
     v.set_block_dimx(1);
@@ -1136,10 +1161,14 @@ inline AMGX_RC vector_set_zero(AMGX_vector_handle vec,
         cudaSetDevice(v.getResources()->getDevice(0));
         cudaCheckError();
 
+    if (v.is_borrowed() && (block_dim != 1 || n < 0 || static_cast<size_t>(n) != v.size()))
+        return AMGX_RC_BAD_PARAMETERS;
     v.resize(n * block_dim);
     v.set_block_dimy(block_dim);
     thrust_wrapper::fill<MemorySpaceMap<AMGX_GET_MODE_VAL(AMGX_MemorySpace, CASE)>::id>(v.begin(), v.end(), types::util<ValueTypeB>::get_zero());
     cudaCheckError();
+    if (v.is_borrowed() && cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess)
+        return AMGX_RC_CUDA_FAILURE;
     return AMGX_RC_OK;
 }
 
@@ -1151,6 +1180,7 @@ inline AMGX_RC vector_set_random(AMGX_vector_handle vec, int n, Resources *resou
     typedef typename VecPrecisionMap<AMGX_GET_MODE_VAL(AMGX_VecPrecision, CASE)>::Type ValueTypeB;
     VectorW wrapV(vec);
     VectorLetterT &v = *wrapV.wrapped();
+    if (v.is_borrowed()) return AMGX_RC_BAD_PARAMETERS;
 
     if (!wrapV.is_valid()
             || n < 0)
@@ -1267,6 +1297,7 @@ inline AMGX_RC read_system(AMGX_matrix_handle mtx,
     if (mtx != NULL)
     {
         mtx_ptr = get_mode_object_from<CASE, Matrix, AMGX_matrix_handle>(mtx);
+        if (mtx_ptr->values.is_borrowed()) return AMGX_RC_BAD_PARAMETERS;
     }
     else
     {
@@ -1282,6 +1313,9 @@ inline AMGX_RC read_system(AMGX_matrix_handle mtx,
     {
         sol_ptr = get_mode_object_from<CASE, Vector, AMGX_vector_handle>(sol);
     }
+
+    if ((rhs_ptr && rhs_ptr->is_borrowed()) || (sol_ptr && sol_ptr->is_borrowed()))
+        return AMGX_RC_BAD_PARAMETERS;
 
     //typedef typename TConfig_h::template setVecPrec<AMGX_vecInt>::Type ivec_value_type_h;
     //typedef typename Vector<ivec_value_type_h> IVector_h;
@@ -1526,6 +1560,7 @@ inline AMGX_RC read_system_distributed(AMGX_matrix_handle mtx,
     if (mtx != NULL)
     {
         mtx_ptr = get_mode_object_from<CASE, Matrix, AMGX_matrix_handle>(mtx);
+        if (mtx_ptr->values.is_borrowed()) return AMGX_RC_BAD_PARAMETERS;
     }
 
     if (rhs != NULL)
@@ -1687,6 +1722,8 @@ inline AMGX_RC generate_distributed_poisson_7pt(AMGX_matrix_handle mtx,
     typedef typename Vector<TConfig>::value_type ValueTypeB;
     MatrixW wrapA(mtx);
     MatrixLetterT &A_part = *wrapA.wrapped();
+    if (A_part.values.is_borrowed())
+        FatalError("Borrowed CSR cannot be replaced or distributed", AMGX_ERR_BAD_PARAMETERS);
     VectorW wrapRhs(rhs_);
     VectorLetterT &rhs = *wrapRhs.wrapped();
     VectorW wrapSol(sol_);
@@ -1756,6 +1793,8 @@ inline AMGX_RC matrix_upload_distributed(AMGX_matrix_handle mtx,
     MatrixDistribution &mdist = *wrapDist.wrapped();
     MatrixW wrapA(mtx);
     MatrixLetterT &A_part = *wrapA.wrapped();
+    if (A_part.values.is_borrowed())
+        FatalError("Borrowed CSR cannot be replaced or distributed", AMGX_ERR_BAD_PARAMETERS);
     cudaSetDevice(A_part.getResources()->getDevice(0));
     cudaCheckError();
     MPI_Comm *mpi_comm = A_part.getResources()->getMpiComm();
@@ -1865,6 +1904,8 @@ inline AMGX_RC matrix_comm_from_maps(AMGX_matrix_handle mtx, int allocated_halo_
     typedef CWrapHandle<AMGX_matrix_handle, MatrixLetterT> MatrixW;
     MatrixW wrapA(mtx);
     MatrixLetterT &A_part = *wrapA.wrapped();
+    if (A_part.values.is_borrowed())
+        FatalError("Borrowed CSR cannot be replaced or distributed", AMGX_ERR_BAD_PARAMETERS);
     cudaSetDevice(A_part.getResources()->getDevice(0));
     cudaCheckError();
 
@@ -2073,6 +2114,9 @@ inline void vector_bind(AMGX_vector_handle vec, const AMGX_matrix_handle mtx)
         FatalError("Matrix and vector don't use same resources, exiting", AMGX_ERR_CONFIGURATION);
     }
 
+    if (x.is_borrowed() && A.manager != NULL)
+        FatalError("Borrowed vectors do not support distributed matrix binding", AMGX_ERR_BAD_PARAMETERS);
+
     if (A.manager != NULL)
     {
         x.setManager(*(A.manager));
@@ -2134,6 +2178,8 @@ inline AMGX_RC matrix_comm_from_maps_one_ring(AMGX_matrix_handle mtx,
     typedef CWrapHandle<AMGX_matrix_handle, MatrixLetterT> MatrixW;
     MatrixW wrapA(mtx);
     MatrixLetterT &A_part = *wrapA.wrapped();
+    if (A_part.values.is_borrowed())
+        FatalError("Borrowed CSR cannot be replaced or distributed", AMGX_ERR_BAD_PARAMETERS);
     cudaSetDevice(A_part.getResources()->getDevice(0));
     cudaCheckError();
 
@@ -2973,6 +3019,11 @@ extern "C" {
 #define AMGX_CASE_LINE(CASE) case CASE: { \
       cudaSetDevice(get_mode_object_from<CASE,Matrix,AMGX_matrix_handle>(mtx)->getResources()->getDevice(0));\
       cudaCheckError(); \
+      { CWrapHandle<AMGX_matrix_handle, Matrix<TemplateMode<CASE>::Type>> wrap(mtx); \
+        if (wrap.wrapped()->values.is_borrowed()) { \
+          if (wrap.wrapped().use_count() != 2) return AMGX_RC_BAD_PARAMETERS; \
+          if (cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess) return AMGX_RC_CUDA_FAILURE; \
+        } } \
       remove_managed_matrix<CASE>(mtx); \
       } \
       break;
@@ -2990,6 +3041,33 @@ extern "C" {
         AMGX_CHECK_API_ERROR(rc, resources)
         return AMGX_RC_OK;
         //return getCAPIerror(rc);
+    }
+
+    AMGX_RC AMGX_API AMGX_matrix_attach_csr(AMGX_matrix_handle mtx, int n, int nnz,
+        int *rows, int *cols, void *data, size_t rows_bytes, size_t cols_bytes,
+        size_t data_bytes, uintptr_t rows_stream, uintptr_t cols_stream, uintptr_t data_stream)
+    {
+        return dispatch_borrowed_matrix(mtx, BorrowedMatrixOperation::attach, n, nnz,
+            rows, cols, data, rows_bytes, cols_bytes, data_bytes, rows_stream, cols_stream, data_stream);
+    }
+
+    AMGX_RC AMGX_API AMGX_matrix_synchronize(AMGX_matrix_handle mtx,
+        uintptr_t rows_stream, uintptr_t cols_stream, uintptr_t data_stream)
+    {
+        return dispatch_borrowed_matrix(mtx, BorrowedMatrixOperation::synchronize,
+            0, 0, nullptr, nullptr, nullptr, 0, 0, 0, rows_stream, cols_stream, data_stream);
+    }
+
+    AMGX_RC AMGX_API AMGX_matrix_detach(AMGX_matrix_handle mtx)
+    {
+        return dispatch_borrowed_matrix(mtx, BorrowedMatrixOperation::detach);
+    }
+
+    AMGX_RC AMGX_API AMGX_matrix_get_attached_data(AMGX_matrix_handle mtx,
+        void **rows, void **cols, void **data)
+    {
+        return dispatch_borrowed_matrix(mtx, BorrowedMatrixOperation::query,
+            0, 0, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, rows, cols, data);
     }
 
     AMGX_RC AMGX_API AMGX_matrix_destroy(AMGX_matrix_handle mtx)
@@ -3318,6 +3396,8 @@ extern "C" {
 #define AMGX_CASE_LINE(CASE) case CASE: { \
       cudaSetDevice(get_mode_object_from<CASE,Vector,AMGX_vector_handle>(vec)->getResources()->getDevice(0));\
       cudaCheckError(); \
+      if (get_mode_object_from<CASE,Vector,AMGX_vector_handle>(vec)->is_borrowed() && \
+          cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess) return AMGX_RC_CUDA_FAILURE;\
       remove_managed_object<CASE,Vector,AMGX_vector_handle>(vec);\
       } \
       break;
@@ -3341,6 +3421,31 @@ extern "C" {
         nvtxRange nvrf(__func__);
 
         return AMGX_vector_destroy_impl(vec);
+    }
+
+    AMGX_RC AMGX_API AMGX_vector_attach(AMGX_vector_handle vec, int n, void *data,
+            size_t capacity_bytes, uintptr_t producer_stream)
+    {
+        return dispatch_borrowed_vector(vec, BorrowedVectorOperation::attach,
+                                       n, data, capacity_bytes, producer_stream);
+    }
+
+    AMGX_RC AMGX_API AMGX_vector_synchronize(AMGX_vector_handle vec, uintptr_t producer_stream)
+    {
+        return dispatch_borrowed_vector(vec, BorrowedVectorOperation::synchronize,
+                                       0, nullptr, 0, producer_stream);
+    }
+
+    AMGX_RC AMGX_API AMGX_vector_detach(AMGX_vector_handle vec)
+    {
+        return dispatch_borrowed_vector(vec, BorrowedVectorOperation::detach);
+    }
+
+    AMGX_RC AMGX_API AMGX_vector_get_attached_data(const AMGX_vector_handle vec,
+            void **data, size_t *size_bytes, int *device)
+    {
+        return dispatch_borrowed_vector(vec, BorrowedVectorOperation::query,
+                                       0, nullptr, 0, 0, data, size_bytes, device);
     }
 
     AMGX_RC AMGX_vector_upload_impl(AMGX_vector_handle vec, int n, int block_dim, const void *data)

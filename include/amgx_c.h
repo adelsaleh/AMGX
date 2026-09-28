@@ -26,6 +26,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "amgx_config.h"
 
 #if defined(__cplusplus)
@@ -352,6 +353,53 @@ AMGX_RC AMGX_API AMGX_vector_upload
  int n,
  int block_dim,
  const void *data);
+
+/* Borrow canonical square scalar CSR device buffers, without copying any of
+ * the three arrays. Requires int32 indices, native real values, an explicit
+ * diagonal in every row, and an empty single-GPU matrix. The structure must
+ * remain unchanged until detach/destroy. Values may be updated between calls;
+ * synchronize the producer and repeat solver setup after changing values.
+ * Scaling and setup that reorder/insert entries are rejected. The caller owns
+ * all allocations and retains them until detach/destroy; destroy solvers that
+ * reference this matrix first. Stream values follow the vector API below. */
+AMGX_RC AMGX_API AMGX_matrix_attach_csr
+(AMGX_matrix_handle mtx, int n, int nnz, int *row_ptrs, int *col_indices,
+ void *data, size_t row_bytes, size_t col_bytes, size_t data_bytes,
+ uintptr_t row_stream, uintptr_t col_stream, uintptr_t data_stream);
+AMGX_RC AMGX_API AMGX_matrix_synchronize
+(AMGX_matrix_handle mtx, uintptr_t row_stream, uintptr_t col_stream, uintptr_t data_stream);
+AMGX_RC AMGX_API AMGX_matrix_detach(AMGX_matrix_handle mtx);
+AMGX_RC AMGX_API AMGX_matrix_get_attached_data
+(AMGX_matrix_handle mtx, void **row_ptrs, void **col_indices, void **data);
+
+/* Borrow a contiguous device allocation without copying or taking ownership.
+ * Initially supports scalar real device vectors (dDDI/dDFI/dFFI), on the
+ * resource's device, without a distributed manager. vec must be empty and not
+ * already attached. n may be zero. capacity_bytes must cover n values.
+ * The caller retains the allocation until detach/destroy, and must not access
+ * it concurrently with AMGX. Borrowed solves currently require an unscaled,
+ * single-GPU scalar matrix. Unsupported operations fail rather than copy.
+ * producer_stream uses CUDA Array Interface values: 1=legacy, 2=PTDS, >2=handle;
+ * 0 means the caller has already completed all producer work. The call waits
+ * only for that producer stream. Repeat synchronize after subsequent writes.
+ * Solves involving attached vectors complete before returning. */
+AMGX_RC AMGX_API AMGX_vector_attach
+(AMGX_vector_handle vec, int n, void *data, size_t capacity_bytes,
+ uintptr_t producer_stream);
+
+/* Complete producer work before another AMGX operation on an attached vector.
+ * The stream and allocation must belong to the resource device. */
+AMGX_RC AMGX_API AMGX_vector_synchronize
+(AMGX_vector_handle vec, uintptr_t producer_stream);
+
+/* Wait for AMGX's legacy execution stream, then release the borrowed view.
+ * No copy/free occurs; the vector becomes empty. */
+AMGX_RC AMGX_API AMGX_vector_detach(AMGX_vector_handle vec);
+
+/* Query attached storage for identity/size checks; fails for owning vectors.
+ * The returned pointer is a borrow, not an allocation ownership transfer. */
+AMGX_RC AMGX_API AMGX_vector_get_attached_data
+(const AMGX_vector_handle vec, void **data, size_t *size_bytes, int *device);
 
 AMGX_RC AMGX_API AMGX_vector_set_zero
 (AMGX_vector_handle vec,

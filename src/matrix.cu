@@ -700,6 +700,8 @@ template<class T_Config>
 AMGX_ERROR
 MatrixBase<T_Config>::resize(index_type num_rows, index_type num_cols, index_type num_nz, int skipDiaCompute)
 {
+    if (values.is_borrowed())
+        FatalError("Cannot resize borrowed CSR", AMGX_ERR_BAD_PARAMETERS);
     if (this->is_initialized())
     {
         FatalError("Debug throw: resizing already initialized matrix\n", AMGX_ERR_BAD_PARAMETERS);
@@ -842,6 +844,8 @@ template<class T_Config>
 void
 MatrixBase<T_Config>::reorderColumnsByColor(bool insert_diagonal)
 {
+    if (values.is_borrowed())
+        FatalError("Cannot reorder borrowed CSR", AMGX_ERR_BAD_PARAMETERS);
     // If columns already reordered, don't reorder again
     if (this->m_cols_reordered_by_color)
     {
@@ -944,6 +948,8 @@ template<class T_Config>
 void
 MatrixBase<T_Config>::sortByRowAndColumn()
 {
+    if (values.is_borrowed())
+        FatalError("Cannot sort borrowed CSR", AMGX_ERR_BAD_PARAMETERS);
     this->set_initialized(0);
     // Add row_indices array
     this->addProps(COO);

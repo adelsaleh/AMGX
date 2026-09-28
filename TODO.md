@@ -1,5 +1,23 @@
 # AMGX communication and logging roadmap
 
+## Completed milestone — borrowed CuPyX CSR
+
+- [x] Build and qualify `AMGX_matrix_attach_csr` and PyAMGX `Matrix.attach_CSR()`.
+  All three native CSR regressions, 136 Python tests, 43 PTDS attachment tests,
+  memory checking, and FP32/FP64 transfer profiles pass. Qualification covers
+  the documented single-GPU scalar CSR contract; dDFI checks its existing
+  unsupported mixed-precision solve error. See [borrowed CSR](docs/borrowed_csr.md).
+
+## Completed downstream milestone — borrowed device vectors
+
+- [x] Qualify the new borrowed-vector storage and C API with PyAMGX
+  `Vector.attach()`. The user-run build and dDDI/dFFI native, Python, and
+  transfer-profile checks pass. The dDFI solve regression exposes the existing
+  unsupported mixed-precision SpMV path; mixed solves are documented as outside
+  this milestone. All three native regressions pass, including its expected error. See
+  [borrowed vectors](docs/borrowed_vectors.md) for ownership, ordering, scope,
+  and the exact build command. BSR integration is paused for this milestone.
+
 ## P0 — block sparse GPU performance
 
 **Next roadmap item:** promote the modern cuSPARSE generic-BSR reference path to a matrix-owned cache with persistent descriptors, preprocessing state, and workspace.
@@ -17,7 +35,7 @@
   - Do not use a process-global pointer-keyed cache: it is unsafe under matrix destruction, allocator address reuse, resetup, and concurrent solver objects.
   - Retain the legacy `cusparse*bsrmv` path for A/B tests and unsupported CUDA/type combinations.
 - [ ] Profile standalone BSR SpMV and complete AMG solves separately for block sizes 2 through 5. Record kernel time, launch count, achieved bandwidth, setup/preprocess cost, smoother time, coarse-level format changes, iterations, and end-to-end solve time.
-  - [x] Re-ran the HDG advection p=1..6 CSR/BSR sweep after rebuilding the 2026-08-24 BICGSTAB/PBICGSTAB propagation patch. Warmed alternating trials covered nx=64, 128, and 256. At nx=256, AMGX-solve speedups were 1.16x/0.97x/1.33x/1.00x/1.22x/1.31x for p=1..6. Nsight p=2 recorded generic `cusparseSpMV` and a 3x3 `bsrmv_tiny_core`, not the old AMGX custom kernel; the isolated BSR GPU SpMV work was about 1.42x faster than CSR, but block-vector reductions and per-call descriptor/workspace handling erased that gain for the complete p=2 solve. Detailed results are in the sibling HDG report `docs/backends/advection_bsr_benchmark_20260824.md`.
+  - [x] Re-ran the HDG advection p=1..6 CSR/BSR sweep after rebuilding the 2026-08-24 BICGSTAB/PBICGSTAB propagation patch. Warmed alternating trials covered nx=64, 128, and 256. At nx=256, AMGX-solve speedups were 1.16x/0.97x/1.33x/1.00x/1.22x/1.31x for p=1..6. Nsight p=2 recorded generic `cusparseSpMV` and a 3x3 `bsrmv_tiny_core`, not the old AMGX custom kernel; the isolated BSR GPU SpMV work was about 1.42x faster than CSR, but block-vector reductions and per-call descriptor/workspace handling erased that gain for the complete p=2 solve. The external application benchmark report is not bundled here.
   - [x] Screen direct PBICGSTAB+`MULTICOLOR_DILU` on the unstructured HDG advection matrix. Unscaled parallel-greedy DILU at weight 0.7 improves fine-mesh p=1..3 wall time over scalar-row L1, but loses at p=4. Trial 6x6/7x7 large-kernel dispatches fail to converge on p=5/6 and are not retained; do not infer support from a random finite-output smoke test.
 - [ ] Decide specialization policy from measurements: modern cuSPARSE for generic blocks, custom subgroup kernels for repeatedly hot awkward sizes, or a size/architecture-dependent dispatcher.
 

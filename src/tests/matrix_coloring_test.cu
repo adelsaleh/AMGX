@@ -195,7 +195,7 @@ void color_histogram(const Vector1 &row_colors, Vector2 &histogram)
     typedef typename Vector1::value_type ValueType; // input value type
     typedef typename Vector2::value_type IndexType; // histogram index type
     // copy input data (could be skipped if input is allowed to be modified)
-    device_vector_alloc<ValueType> data(row_colors);
+    device_vector_alloc<ValueType> data(row_colors.begin(), row_colors.end());
     // sort data to bring equal elements together
     thrust_wrapper::sort<AMGX_device>(data.begin(), data.end());
     // number of histogram bins is equal to the maximum value plus one

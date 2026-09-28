@@ -24,6 +24,8 @@ set(tests_all ${tests_all}
     test_utils.cu
     unit_test.cu
     tests/device_memory_stats.cu
+    tests/borrowed_vectors.cu
+    tests/borrowed_csr.cu
     tests/gmres_reliable_residual.cu
     tests/bicgstab_residual.cu
     tests/krylov_bsr_spmv_backend.cu

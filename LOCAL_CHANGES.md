@@ -1,7 +1,7 @@
 # Downstream AMGX change registry
 
-This checkout is not an unmodified NVIDIA AMGX tree. It is the AMGX component
-used by the sibling `hdg` and `pyamgx` repositories in this workspace. Keep this
+This checkout is not an unmodified NVIDIA AMGX tree. It includes downstream solver experiments and APIs used by companion
+Python bindings and application integrations. Keep this
 file current whenever source behavior, the C API, configuration semantics, CUDA
 requirements, or build/runtime coupling changes.
 
@@ -72,8 +72,7 @@ The upstream comparison point for the current branch is `upstream/main` at
   the fine nx=256 case made BSR 1.16x, 1.33x, 1.22x, and 1.31x faster in AMGX
   solve time at p=1, 3, 5, and 6. Nsight confirmed CUDA-13 generic BSR dispatch
   at p=2 with `cusparseSpMV`/`bsrmv_tiny_core` and no legacy or custom-3x3
-  SpMV. See the sibling HDG report
-  `docs/backends/advection_bsr_benchmark_20260824.md`.
+  SpMV. The external application benchmark report is not bundled here.
 - Native-regression status: passed after rebuilding `amgx_tests_launcher`.
   `KrylovBsrSpmvBackend`, `DeviceMemoryStats`, `GMRESReliableResidual`, and
   `BiCGStabResidual` all passed in `dDDI` mode (4 tests, 0 failures). The later
@@ -150,8 +149,8 @@ change the scalar SpMV route. BSR block dimensions are supplied by the caller vi
 
 ## CUDA and binary coupling
 
-- Generic BSR SpMV requires CUDA 13.0 Update 1 or newer in practice. The active
-  workspace toolkit is `/tmp/cuda-13.0.1`.
+- Generic BSR SpMV requires CUDA 13.0 Update 1 or newer in practice. The referenced qualification used CUDA 13.0.1; select your toolkit
+  directory when configuring the build.
 - Rebuild AMGX after every source change and rebuild PyAMGX whenever the AMGX
   library location, ABI, or linked CUDA toolkit changes.
 - At runtime, confirm `libamgxsh.so`, cuBLAS, cuSPARSE, and cuSOLVER all resolve

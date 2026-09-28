@@ -33,6 +33,11 @@ outside that pattern.
 
 ## Backend sequence
 
+Paths below use generic placeholders. Set them to your own AMGX/CUDA
+locations. Historical application harnesses and raw logs are not bundled;
+`/path/to/application/benchmark.py` denotes an external harness, not a script
+provided by this repository. `results/` denotes a user-selected output directory.
+
 ### Checkpoint 0: establish the unchanged 4x4 baseline
 
 Add a deterministic native test for a row-major 4x4 BSR matrix. Compare one
@@ -120,7 +125,7 @@ For HDG advection:
 
 Results are appended here only after the exact source revision, linked CUDA
 libraries, command, warm-up count, measured trial count, and pass/fail status
-have been recorded. Raw bulky output belongs under `/tmp`; this document keeps
+have been recorded. Raw bulky output belongs in a user-selected results directory; this document keeps
 the durable summary and artifact paths.
 
 ### Checkpoint 0
@@ -133,16 +138,16 @@ Environment:
 - AMGX branch: `quality-of-life`;
 - base revision: `6699fa4276c0ec0ea0aee6513855e1cc7a866d68` plus the documented
   BICGSTAB/PBICGSTAB generic-BSR working-tree changes;
-- build tree: `/tmp/AMGX-build-cuda13.0.1`;
+- build tree: `/path/to/AMGX/build`;
 - GPU: Quadro RTX 6000, compute capability 7.5;
 - AMGX linked against CUDA 13.0.1 libraries under
-  `/tmp/cuda-13.0.1/targets/x86_64-linux/lib`;
+  `/path/to/cuda/targets/x86_64-linux/lib`;
 - CuPy-reported runtime: 13.2; CUDA driver: 13.0.
 
 Focused build:
 
 ```bash
-cmake --build /tmp/AMGX-build-cuda13.0.1 \
+cmake --build /path/to/AMGX/build \
   --target amgx_tests_launcher -j 16
 ```
 
@@ -157,8 +162,8 @@ Focused native test:
 
 ```bash
 env \
-  LD_LIBRARY_PATH=/tmp/AMGX-build-cuda13.0.1:/tmp/cuda-13.0.1/targets/x86_64-linux/lib \
-  /tmp/AMGX-build-cuda13.0.1/src/amgx_tests_launcher \
+  LD_LIBRARY_PATH=/path/to/AMGX/build:/path/to/cuda/targets/x86_64-linux/lib \
+  /path/to/AMGX/build/src/amgx_tests_launcher \
   --mode dDDI BlockILUBackend --verbose
 ```
 
@@ -168,7 +173,7 @@ five-test focused regression containing `BlockILUBackend`,
 `DeviceMemoryStats` also passed with zero failures.
 
 The HDG baseline used the retained matched benchmark harness
-`/tmp/codex_adv_test2_amgx_bench.py` and this preconditioner:
+`/path/to/application/benchmark.py` and this preconditioner:
 
 ```text
 PBICGSTAB
@@ -185,12 +190,12 @@ Representative convergent command:
 
 ```bash
 env \
-  LD_LIBRARY_PATH=/tmp/AMGX-build-cuda13.0.1:/tmp/cuda-13.0.1/targets/x86_64-linux/lib \
-  .venv/bin/python /tmp/codex_adv_test2_amgx_bench.py \
+  LD_LIBRARY_PATH=/path/to/AMGX/build:/path/to/cuda/targets/x86_64-linux/lib \
+  python /path/to/application/benchmark.py \
   --mesh-size 0.05 --orders 3 \
   --variants pbicgstab_multicolor_ilu0_07 \
   --formats bsr --scales off --warmups 1 --repeats 3 \
-  --output /tmp/codex-block-ilu-checkpoint0-ms005-p3.jsonl
+  --output results/block-ilu-checkpoint0-ms005-p3.jsonl
 ```
 
 Tiny-mesh screening produced the following results. A failed warm-up has no
@@ -211,10 +216,10 @@ it included initialization/JIT/cache effects and is excluded from the median.
 
 Raw result artifacts:
 
-- `/tmp/codex-block-ilu-checkpoint0-ms020-p3.jsonl`;
-- `/tmp/codex-block-ilu-checkpoint0-ms020-p3-scaled.jsonl`;
-- `/tmp/codex-block-ilu-checkpoint0-ms010-p3.jsonl`;
-- `/tmp/codex-block-ilu-checkpoint0-ms005-p3.jsonl`.
+- `results/block-ilu-checkpoint0-ms020-p3.jsonl`;
+- `results/block-ilu-checkpoint0-ms020-p3-scaled.jsonl`;
+- `results/block-ilu-checkpoint0-ms010-p3.jsonl`;
+- `results/block-ilu-checkpoint0-ms005-p3.jsonl`.
 
 Interpretation: the native arithmetic baseline is valid, but the current
 unscaled p=3 ILU(0) preset has a small-mesh stability boundary between 944 and
@@ -281,17 +286,17 @@ deprecated and announced for removal in the next major CUDA release.
 Build command:
 
 ```bash
-cmake --build /tmp/AMGX-build-cuda13.0.1 \
+cmake --build /path/to/AMGX/build \
   --target amgx_tests_launcher -j 16
 ```
 
 The build passed. Its deprecation warnings are expected and retained in
-`/tmp/codex-amgx-block-ilu-build-final.log`.
+`results/amgx-block-ilu-build-final.log`.
 
 Focused test command:
 
 ```bash
-cd /tmp/AMGX-build-cuda13.0.1/src
+cd /path/to/AMGX/build/src
 ./amgx_tests_launcher --mode dDDI \
   BlockILUBackend KrylovBsrSpmvBackend SmootherBlocksizes \
   BiCGStabResidual DeviceMemoryStats
@@ -302,7 +307,7 @@ All five tests passed. `BlockILUBackend` first preserves the historical AMGX
 block-tridiagonal matrices for every `b=2,...,7`. Because that pattern has no
 missing fill, block ILU(0) is exact; every application agreed with the pivoted
 host dense solve to `1e-10`. The final launcher output is
-`/tmp/codex-amgx-block-ilu-tests-final.log`.
+`results/amgx-block-ilu-tests-final.log`.
 
 #### HDG benchmark commands
 
@@ -311,9 +316,9 @@ BSR, external scaling enabled, one warm-up, and three measured trials. Commands
 were run from the `hdg` repository with:
 
 ```bash
-LD_LIBRARY_PATH=/tmp/AMGX-build-cuda13.0.1:/tmp/AMGX-install/lib:\
-/tmp/cuda-13.0.1/targets/x86_64-linux/lib \
-.venv/bin/python /tmp/codex_adv_test2_amgx_bench.py \
+LD_LIBRARY_PATH=/path/to/AMGX/build:/path/to/AMGX/install/lib:\
+/path/to/cuda/targets/x86_64-linux/lib \
+python /path/to/application/benchmark.py \
   --mesh-size MESH --orders 1,2,3,4,5,6 \
   --variants pbicgstab_cusparse_legacy_ilu0_09 \
   --formats bsr --scales on --warmups 1 --repeats 3 \
@@ -408,9 +413,9 @@ The main run failed at p=1 and p=3 during warm-up, after one measured p=4 trial,
 and at p=6 during warm-up. An identical retry produced only two measured p=1
 solves before a non-finite failure and failed again for p=3,4,6. These rows are
 therefore marked unstable instead of reporting partial medians. The full run is
-`/tmp/codex-block-ilu-fine-219k-20260825.jsonl`; its `.stdout` sibling contains
+`results/block-ilu-fine-219k-20260825.jsonl`; its `.stdout` sibling contains
 warm-ups and failures. The controlled retry is
-`/tmp/codex-block-ilu-fine-219k-bicgstab-retry-20260825.jsonl`.
+`results/block-ilu-fine-219k-bicgstab-retry-20260825.jsonl`.
 
 Additional screening retained in `/tmp`:
 

@@ -103,6 +103,7 @@ class AMG_Solver
         const Solver<T_Config> *getSolverObject( ) const { return solver; }
 
         inline Resources *getResources() const { return m_resources; }
+        bool uses_borrowed_matrix() const { return m_ptrA && m_ptrA->values.is_borrowed(); }
         inline AMG_Config *getConfig() const { return m_cfg; }
         inline void setResources(Resources *resources) { m_resources = resources; }
 

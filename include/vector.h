@@ -62,6 +62,7 @@ enum ColoringType
 #include <amgx_types/pod_types.h>
 
 #include "vector_thrust_allocator.h"
+#include "device_vector_storage.h"
 
 namespace amgx
 {
@@ -156,8 +157,8 @@ class Vector<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> > : publ
         Vector() :  block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_host_buffer(NULL), explicit_buffer_size(0), m_unconsolidated_size(0), m_resources(0) { };
         inline Vector(unsigned int N) : amgx::thrust::host_vector<value_type>(N), block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
         inline Vector(unsigned int N, value_type v) : amgx::thrust::host_vector<value_type>(N, v), block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
-        inline Vector(const Vector<TConfig_h> &a) : amgx::thrust::host_vector<value_type>(a), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
-        inline Vector(const Vector<TConfig_d> &a) : amgx::thrust::host_vector<value_type>(a), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
+        inline Vector(const Vector<TConfig_h> &a) : amgx::thrust::host_vector<value_type>(a.begin(), a.end()), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
+        inline Vector(const Vector<TConfig_d> &a) : amgx::thrust::host_vector<value_type>(a.begin(), a.end()), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
 
         ~Vector()
         {
@@ -292,6 +293,8 @@ class Vector<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> > : publ
             }
         }
 
+        bool is_borrowed() const { return false; }
+
         inline void sync() { event.sync(); }
 
         inline Vector<TConfig_h> &operator=(const cusp::array1d<value_type, host_memory> &a) { copy(a); return *this; }
@@ -402,7 +405,7 @@ class Vector<TemplateConfig<AMGX_host, t_vecPrec, t_matPrec, t_indPrec> > : publ
 
 // specialization for device
 template <AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
-class Vector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > : public device_vector_alloc<typename VecPrecisionMap<t_vecPrec>::Type>
+class Vector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > : public device_vector_storage<typename VecPrecisionMap<t_vecPrec>::Type>
 {
         typedef typename MemorySpaceMap<AMGX_host>::Type host_memory;
         typedef typename MemorySpaceMap<AMGX_device>::Type device_memory;
@@ -416,11 +419,11 @@ class Vector<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> > : pu
         typedef cusp::array1d_format format;
 
         Vector() : block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
-        inline Vector(unsigned int N) : device_vector_alloc<value_type>(N), block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
-        inline Vector(unsigned int N, int dimx, int dimy) : device_vector_alloc<value_type>(N), block_dimx(dimx), block_dimy(dimy), num_rows(0), num_cols(1), lda(0), buffer(NULL), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
-        inline Vector(unsigned int N, value_type v) : device_vector_alloc<value_type>(N, v), block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
-        inline Vector(const Vector<TConfig_h> &a) : device_vector_alloc<value_type>(a), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
-        inline Vector(const Vector<TConfig_d> &a) : device_vector_alloc<value_type>(a), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
+        inline Vector(unsigned int N) : device_vector_storage<value_type>(N), block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
+        inline Vector(unsigned int N, int dimx, int dimy) : device_vector_storage<value_type>(N), block_dimx(dimx), block_dimy(dimy), num_rows(0), num_cols(1), lda(0), buffer(NULL), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
+        inline Vector(unsigned int N, value_type v) : device_vector_storage<value_type>(N, v), block_dimx(1), block_dimy(1), num_rows(0), num_cols(1), lda(0), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
+        inline Vector(const Vector<TConfig_h> &a) : device_vector_storage<value_type>(a), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
+        inline Vector(const Vector<TConfig_d> &a) : device_vector_storage<value_type>(a), block_dimx(a.get_block_dimx()), block_dimy(a.get_block_dimy()), num_rows(a.get_num_rows()), num_cols(a.get_num_cols()), lda(a.get_lda()), buffer(NULL), buffer_size(0), dirtybit(1), in_transfer(IDLE), tag(-1), delayed_send(1), cancel(0), manager(NULL), v_is_transformed(false), v_is_read_partitioned(false), host_send_recv_buffer(NULL), linear_buffers_size(0), explicit_buffer_size(0), explicit_host_buffer(NULL), m_unconsolidated_size(0), m_resources(0) {}
 
         ~Vector()
         {

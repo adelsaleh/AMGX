@@ -510,6 +510,11 @@ void Solver<TConfig>::setup( Operator<TConfig> &A, bool reuse_matrix_structure)
     {
         Matrix<TConfig> &B = *B_ptr;
 
+        if (B.values.is_borrowed() && (m_Scaler != nullptr ||
+            this->getReorderColsByColorDesired() || this->getInsertDiagonalDesired()))
+            FatalError("Borrowed CSR requires setup without scaling, reordering, or diagonal insertion",
+                       AMGX_ERR_BAD_PARAMETERS);
+
         if (!B.is_initialized())
             FatalError("Trying to setup from the uninitialized matrix",
                        AMGX_ERR_BAD_PARAMETERS);
@@ -736,6 +741,42 @@ AMGX_STATUS Solver<TConfig>::solve(Vector<TConfig> &b, Vector<TConfig> &x,
     if (b.get_block_size() != m_A->get_block_dimy())
     {
         FatalError("Block sizes do not match", AMGX_ERR_BAD_PARAMETERS);
+    }
+
+    auto *borrowed_matrix = dynamic_cast<Matrix<TConfig> *>(m_A);
+    if (borrowed_matrix && borrowed_matrix->values.is_borrowed())
+    {
+        const uintptr_t matrix_ptrs[] = {
+            reinterpret_cast<uintptr_t>(borrowed_matrix->row_offsets.raw()),
+            reinterpret_cast<uintptr_t>(borrowed_matrix->col_indices.raw()),
+            reinterpret_cast<uintptr_t>(borrowed_matrix->values.raw())};
+        const size_t matrix_sizes[] = {borrowed_matrix->row_offsets.bytes(),
+            borrowed_matrix->col_indices.bytes(), borrowed_matrix->values.bytes()};
+        for (int i = 0; i < 3; ++i)
+        {
+            const uintptr_t bp = reinterpret_cast<uintptr_t>(b.raw());
+            const uintptr_t xp = reinterpret_cast<uintptr_t>(x.raw());
+            const uintptr_t mp = matrix_ptrs[i];
+            if ((bp < mp ? mp - bp < b.bytes() : bp - mp < matrix_sizes[i]) ||
+                (xp < mp ? mp - xp < x.bytes() : xp - mp < matrix_sizes[i]))
+                FatalError("RHS and solution must not overlap borrowed CSR storage", AMGX_ERR_BAD_PARAMETERS);
+        }
+    }
+
+    if (b.is_borrowed() || x.is_borrowed())
+    {
+        auto *matrix = dynamic_cast<Matrix<TConfig> *>(m_A);
+        if (!matrix || matrix->manager != nullptr || m_Scaler != nullptr ||
+            m_A->get_block_dimx() != 1 || m_A->get_block_dimy() != 1 ||
+            b.getManager() != nullptr || x.getManager() != nullptr ||
+            b.size() != static_cast<size_t>(m_A->get_num_rows()) ||
+            x.size() != static_cast<size_t>(m_A->get_num_cols()))
+            FatalError("Borrowed vectors require an unscaled single-GPU scalar matrix and exact vector sizes",
+                       AMGX_ERR_BAD_PARAMETERS);
+        const uintptr_t bp = reinterpret_cast<uintptr_t>(b.raw());
+        const uintptr_t xp = reinterpret_cast<uintptr_t>(x.raw());
+        if (bp < xp ? xp - bp < b.bytes() : bp - xp < x.bytes())
+            FatalError("Borrowed RHS and solution must not overlap", AMGX_ERR_BAD_PARAMETERS);
     }
 
     //  --- Gluing path for vectors ---
