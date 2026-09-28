@@ -1,12 +1,46 @@
 # Algebraic Multigrid Solver (AmgX) Library
 
+## Features in this fork
+
+The `hdg-cuda13-integration` branch extends `main` with:
+
+- **Borrowed GPU buffers:** `AMGX_matrix_attach_csr` and `AMGX_vector_attach`
+  share caller-owned device storage, with detach and pointer-query APIs.
+  Solutions are written directly into the attached output allocation.
+- **Safe synchronous attachment:** producer-stream ordering, ownership checks,
+  and guards against resizing or mutating borrowed CSR structure. See the
+  [CSR](docs/borrowed_csr.md) and [vector](docs/borrowed_vectors.md) contracts.
+- **Solver diagnostics:** live/reserved/peak device-memory counters, improved
+  residual reporting, and interval-controlled solve statistics.
+- **Experimental block-system extensions:** block-aware classical AMG,
+  optional CUDA 13 generic BSR SpMV, and a legacy-cuSPARSE block ILU(0)
+  reference backend.
+- **Experimental convergence checks:** residual-growth monitoring with
+  configurable patience/grace and independent residual checks on suspected
+  divergence.
+- **Experimental hierarchy/smoother options:** export classical AMG transfer
+  operators and coarse matrices, supply Chebyshev spectral bounds or use an
+  SPD weighted-power estimate, and explore block-smoother variants.
+
+These experimental paths have limited, configuration-specific validation;
+they are not general robustness or performance recommendations. See
+[downstream changes](LOCAL_CHANGES.md) for the fixes, options, and evidence.
+
+Borrowed CSR is qualified for single-GPU square scalar matrices with canonical
+int32 indices, explicit diagonal entries, and FP32/FP64 values (`dFFI`/`dDDI`).
+Borrowed BSR, distributed storage, and mixed-precision solves are outside this
+qualified contract. Internal solver workspaces and AMG coarse levels still
+allocate memory; attachment does not transfer ownership of caller buffers.
+
+Reuse solver setup for changing RHS. After in-place coefficient changes, call
+`AMGX_solver_setup` again; `structure_reuse_levels=0` rebuilds the AMG hierarchy.
+The companion [PyAMGX branch](https://github.com/adelsaleh/pyamgx/tree/quality-of-life)
+provides direct CuPyX/CuPy attachment and a `ReusableSolver` context manager.
+
+## Upstream overview
+
 AmgX is a GPU accelerated core solver library that speeds up computationally intense linear solver portion of simulations. The library includes a flexible solver composition system that allows a user to easily construct complex nested solvers and preconditioners. The library is well suited for implicit unstructured methods.
 The AmgX library offers optimized methods for massive parallelism, the flexibility to choose how the solvers are constructed, and is accessible through a simple C API that abstracts the parallelism and scale across a single or multiple GPUs using user provided MPI.
-
-This workspace checkout carries documented downstream changes on top of NVIDIA
-AMGX on the `hdg-cuda13-integration` branch. See
-[LOCAL_CHANGES.md](LOCAL_CHANGES.md) before rebasing, rebuilding, or comparing
-behavior with upstream binaries.
 
 This is the source of the [AMGX library](https://developer.nvidia.com/amgx) on the NVIDIA Registered Developer Program portal.
 

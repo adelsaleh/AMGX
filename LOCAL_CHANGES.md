@@ -11,6 +11,29 @@ The upstream comparison point for the current branch is `upstream/main` at
 
 ## Applied changes
 
+### Borrowed device vectors and scalar CSR
+
+- Commit: `f73ec35bd08171ba2f25c282af6b3d102025751a`.
+- Adds `AMGX_vector_attach` and `AMGX_matrix_attach_csr`, plus synchronization,
+  detach, and attached-pointer queries. Caller-owned GPU buffers remain shared;
+  the existing upload APIs still copy. Internal metadata and solver workspaces
+  remain AMGX-owned.
+- Setup/solve involving borrowed storage complete synchronously, with producer
+  stream ordering and guards against incompatible shapes, overlapping buffers,
+  CSR mutation, or releasing a matrix retained by a solver. Coefficient changes
+  require producer synchronization and a new setup; use
+  `structure_reuse_levels=0` to rebuild AMG.
+- Qualification is limited to the documented single-GPU scalar FP32/FP64
+  contract: canonical int32 CSR with explicit diagonals. Mixed dDFI solves
+  retain the existing unsupported SpMV error; borrowed BSR and distributed
+  use are excluded. See [CSR](docs/borrowed_csr.md) and
+  [vector](docs/borrowed_vectors.md) contracts.
+- After the user-run build, all three native BorrowedCSR and three
+  BorrowedVectors regressions passed. Companion PyAMGX records Python/PTDS
+  tests, memory checks, and FP32/FP64 transfer profiles. Its `quality-of-life`
+  branch exposes these C APIs and the reusable-solver wrapper; the binding
+  must be built against matching headers and library.
+
 ### Solver diagnostics and memory reporting
 
 - Commit: `7e6515188dfd06468f95c2626ab30de0c8f8cacb`
@@ -48,6 +71,8 @@ The upstream comparison point for the current branch is `upstream/main` at
   views and retains legacy cuSPARSE fallback.
 - Detailed algorithmic status, validation cases, and performance findings remain
   in `TODO.md` under the block-sparse and classical-AMG sections.
+- Adds `device_mem_pool_enabled` as an optional allocator-pool control. It
+  does not imply allocation-free setup/solve or zero runtime reservations.
 
 ### Direct BICGSTAB/PBICGSTAB generic-BSR selection
 
@@ -120,6 +145,35 @@ The upstream comparison point for the current branch is `upstream/main` at
 - Design constraints, source hashes, exact commands, timings, residuals, raw
   artifact paths, and the next `bsrsv2` policy / scalar-CSR `cusparseSpSV`
   checkpoints are maintained in `doc/experimental_block_ilu_backend.md`.
+
+### Experimental block-AMG smoothing and residual monitoring changes
+
+- Commit: `7096fa209038c8c7a07f1a761af976e6629d59a3` (2026-09-23).
+- Clears reusable coarse-correction buffers before zero-start fixed-cycle
+  pre-smoothing to avoid retaining a previous correction. Adds opt-in
+  `block_jacobi_zero_start_fastpath`; corrects diagonal-block SpMV nonzero
+  counts and generic-BSR dispatch, and revises multicolor DILU block handling.
+  These changes do not establish better performance across block sizes.
+- Extends `chebyshev_lambda_estimate_mode` with user bounds (3) and an SPD
+  weighted-power estimate (4), and adds optional
+  `chebyshev_reuse_initial_preconditioner` for fixed preconditioners. The SPD
+  estimate is not a general spectral estimator for nonsymmetric systems.
+- Adds `block_graph_dense_constraint_mode=constant_vector` for nodal scalar
+  Poisson interpolation experiments and `classical_hierarchy_export_prefix`
+  for lossless exports of interpolation, restriction, and coarse matrices.
+  These are experimental algorithm/inspection options, not recommended presets.
+- Revises the optional `rel_div_tolerance` guard to track growth against the
+  best monitored residual with a roundoff floor. Adds `divergence_patience`
+  and `divergence_grace_iters`, checks suspected divergence against an
+  independent `b-A*x` residual when the current solution is available, and
+  handles nonfinite residuals in GMRES/FGMRES paths. The growth guard is disabled
+  by default; it is not a guarantee of convergence or breakdown recovery.
+- Validation at commit time was source inspection and whitespace checks only;
+  no native build or GPU execution was performed for that commit. Subsequent
+  builds and scalar CSR/AMG attachment benchmarks exercise selected paths,
+  including a million-DOF shifted Laplacian. They do not qualify all of these
+  block-smoother, Chebyshev, interpolation, export, or divergence options.
+  Broader numerical and performance validation remains outstanding.
 
 ## Configuration contract
 
