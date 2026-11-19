@@ -3051,6 +3051,16 @@ extern "C" {
             rows, cols, data, rows_bytes, cols_bytes, data_bytes, rows_stream, cols_stream, data_stream);
     }
 
+    AMGX_RC AMGX_API AMGX_matrix_attach_bsr(AMGX_matrix_handle mtx, int n, int nnz,
+        int block_dimx, int block_dimy, int *rows, int *cols, void *data, size_t rows_bytes,
+        size_t cols_bytes, size_t data_bytes, uintptr_t rows_stream, uintptr_t cols_stream,
+        uintptr_t data_stream)
+    {
+        return dispatch_borrowed_matrix(mtx, BorrowedMatrixOperation::attach, n, nnz,
+            rows, cols, data, rows_bytes, cols_bytes, data_bytes, rows_stream, cols_stream, data_stream,
+            nullptr, nullptr, nullptr, block_dimx, block_dimy);
+    }
+
     AMGX_RC AMGX_API AMGX_matrix_synchronize(AMGX_matrix_handle mtx,
         uintptr_t rows_stream, uintptr_t cols_stream, uintptr_t data_stream)
     {

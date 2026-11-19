@@ -9,6 +9,7 @@
 #include <thrust/transform_reduce.h>
 #include <thrust/functional.h>
 #include <thrust/device_ptr.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/sort.h>
 #include <thrust/gather.h>
 #include <vector_thrust_allocator.h>
@@ -21,11 +22,13 @@
 template<typename T>
 struct row_length
 {
-    __host__ __device__ T operator()(const T &x) const
+    const T *row_offsets;
+
+    __host__ __device__ T operator()(T row) const
     {
-        const T *next_ptr = &x;
-        next_ptr++;
-        return (*next_ptr) - x;
+        // A reduction may pass a local copy of its input to this functor.
+        // Only explicit row indices guarantee adjacent CSR offsets are read.
+        return row_offsets[row + 1] - row_offsets[row];
     }
 };
 
@@ -1206,7 +1209,8 @@ void reorderElementsDeviceCSR(INDEX_TYPE num_rows,
                               T *values,
                               INDEX_TYPE block_size)
 {
-    INDEX_TYPE max_row_length = std::max(1, thrust_wrapper::transform_reduce<AMGX_device>(row_offsets, row_offsets + num_rows, row_length<INDEX_TYPE>(), 0, amgx::thrust::maximum<INDEX_TYPE>()));
+    const amgx::thrust::counting_iterator<INDEX_TYPE> first_row(0);
+    INDEX_TYPE max_row_length = std::max(1, thrust_wrapper::transform_reduce<AMGX_device>(first_row, first_row + num_rows, row_length<INDEX_TYPE>{row_offsets}, 0, amgx::thrust::maximum<INDEX_TYPE>()));
     //TODO: optimise this in terms of storage
     INDEX_TYPE storage_space = 100 * 1024 * 1024 * sizeof(T) / sizeof(cuDoubleComplex); // because we allocate as for cuComplex
     INDEX_TYPE blocks = 1500 < storage_space / (max_row_length * block_size * sizeof(T)) ? 1500 : storage_space / (max_row_length * block_size * sizeof(T));

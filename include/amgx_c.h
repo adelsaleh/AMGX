@@ -366,6 +366,15 @@ AMGX_RC AMGX_API AMGX_matrix_attach_csr
 (AMGX_matrix_handle mtx, int n, int nnz, int *row_ptrs, int *col_indices,
  void *data, size_t row_bytes, size_t col_bytes, size_t data_bytes,
  uintptr_t row_stream, uintptr_t col_stream, uintptr_t data_stream);
+/* Borrow canonical square-block BSR device buffers (block_dimx == block_dimy):
+ * the CSR contract above per block row, with data holding nnz * block_dimx *
+ * block_dimy values in block-row-major order, as AMGX_matrix_upload_all takes.
+ * Setup must not reorder columns by color or insert diagonals; every block row
+ * needs an explicit diagonal block. block_dimx = block_dimy = 1 is attach_csr. */
+AMGX_RC AMGX_API AMGX_matrix_attach_bsr
+(AMGX_matrix_handle mtx, int n, int nnz, int block_dimx, int block_dimy, int *row_ptrs,
+ int *col_indices, void *data, size_t row_bytes, size_t col_bytes, size_t data_bytes,
+ uintptr_t row_stream, uintptr_t col_stream, uintptr_t data_stream);
 AMGX_RC AMGX_API AMGX_matrix_synchronize
 (AMGX_matrix_handle mtx, uintptr_t row_stream, uintptr_t col_stream, uintptr_t data_stream);
 AMGX_RC AMGX_API AMGX_matrix_detach(AMGX_matrix_handle mtx);

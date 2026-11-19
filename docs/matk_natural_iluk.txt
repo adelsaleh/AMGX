@@ -1,0 +1,282 @@
+Order-preserving higher-fill ILU — 2026-10-31
+===========================================
+
+Current status: experimental; architecture autotuning deferred
+------------------------------------------------------------
+On 2026-10-31 supplied-order ILU(k) was kept experimental, automatic
+architecture tuning was postponed, and the merge followed the qualification
+runs of that date. The explicit
+block_ilu_backend=cusparse_legacy selection and all existing numerical settings
+remain unchanged. Inclusion in the merged library does not make this a default
+or automatically selected preconditioner. No new ILU(k) tuning was performed.
+
+The separately qualified native multicolor ILU(0/1) synchronization corrections
+preserve their cofactor inverse, determinant fallback, fill and relaxation
+policies; their evidence does not extend the supplied-order ILU(k) contract.
+See docs/ilu_synchronization_qualification.md for that distinct qualification.
+The historical ILU(k) design, tests and numerical limitations below remain
+authoritative for this experimental opt-in path.
+
+Scope and distinction from existing AMGX ILU(1)
+------------------------------------------------
+AMGX already implements native MULTICOLOR_ILU(1). Its symbolic routine in
+csr_multiply_detail.cu compares graph colors, and factorization visits color
+groups. This extension does not replace that path. It extends the existing
+block_ilu_backend=cusparse_legacy path so ilu_sparsity_level=k>=0 preserves the
+supplied block-row order. A PARDISO permutation remains external preprocessing.
+
+The underlying NVIDIA bsrilu02 routine is still zero-fill and non-pivoting:
+https://docs.nvidia.com/cuda/pdf/CUSPARSE_Library.pdf (bsrilu02, pp134-136 in
+Release13.4 consulted2026-10-31). We explicitly construct the ILU(k) factor
+pattern first, insert zero values at new positions, and run zero-fill numerical
+factorization on that expanded pattern. This is ordinary level-of-fill ILU(k),
+not adjacency-power expansion, ILUT, or a pivoting factorization.
+
+Implementation
+--------------
+include/solvers/natural_ilu_pattern.h implements host symbolic ILU(k).
+Original stored blocks, including explicit zeros, start at level0. Processing
+pivot j<i updates level(i,t)=min(level(i,t),level(i,j)+level(j,t)+1), t>j.
+A sparse min-heap processes lower columns in supplied order; original and newly
+retained entries are emitted in sorted column order. An explicit source-to-LU
+mapping preserves all original coefficients. Working storage is O(n+nnz(LU)).
+
+src/solvers/multicolor_ilu_solver.cu integrates the pattern only when
+block_ilu_backend=cusparse_legacy. The existing device scatter fills private
+m_LU.values after zeroing new slots; cuSPARSE factors/applications remain on GPU.
+Input m_explicit_A is never replaced by LU, so all operator matvecs/residuals
+still use the original matrix. CPU symbolic setup is intentional and reported.
+No new coloring is requested. Existing native multicolor ILU behavior remains.
+
+Supported contract: single GPU, square row-major BSR/CSR, int32 canonical block
+columns and stored internal diagonal; existing equal-precision real numerical
+backend limits still apply. Missing/unsorted/duplicate columns are diagnosed.
+The factor limit includes AMGX's extra sentinel block and signed32 scalar value
+count. Construction fails explicitly before overflow; it does not silently
+truncate fill. GPU allocation is checked against80% of currently free memory.
+That check excludes opaque cuSPARSE workspace and later Krylov allocation.
+Structural reuse assumes the caller keeps the same sparsity pattern, as before.
+
+Isolated build
+--------------
+An isolated build tree (build script, source patch, source snapshot and
+provenance) contains a snapshot of only this extension applied to the baseline source.
+It excludes the earlier experimental multicolor capacity edits present in the
+shared worktree. It recompiles only multicolor_ilu_solver.cu and reuses all
+other baseline objects. No class layout or C API changes; no pyamgx rebuild.
+Production-library SHA256 remains:
+8fdb9d2377b2d065a90a87b30cf5e7ff8a0c94b2e8b09bb293e0f106e0a2154e
+Initial isolated-library SHA256 (first qualification and the six full trials):
+96abf0304e617aae3c888361da109439bdab4c73eda1b2366232f61c92e31c97
+The core parameter-description text is updated in source; this description-only
+change does not require replacing the isolated build's baseline core object.
+
+Final error-path review found that amgx_exception derives from std::exception.
+An explicit rethrow now preserves AMGX allocation/CUDA error codes and their
+original call sites instead of relabelling them as bad parameters. Numerical
+factorization/application code is unchanged. The initial library, source and
+logs are preserved in before-error-code-fix/ within the isolated build.
+Final isolated-library SHA256:
+973c02b0f08604812d7c69d70be78590baf05270bc2d6a95221161bc8c8e696a
+
+Qualification
+-------------
+check_natural_ilu_pattern.cpp compared600 patterns against an independent dense,
+pivot-major elimination reference for120 asymmetric graphs, k=0/1/2/3/32. It
+exercised5913 level-two entries and five rejection cases. Compiled with warnings
+as errors. Host ASan/UBSan was unavailable because this machine lacks runtime
+libraries; no host sanitizer pass is claimed.
+
+First GPU qualification, passed in 8 s:
+  baseline ILU0:20/20 cases passed
+  new ILU(k):80/80 cases passed, b1/2/4/8/16, k0/1/2/3, dDDI/dFFI,
+             original and explicitly permuted block orderings
+  Each case: independent dense-block CPU factor application, zero-flag solve
+  with deliberately nonzero supplied buffer, nonzero-guess correction, damping,
+  coefficient replacement and AMGX_solver_resetup. Device original CSR/BSR
+  indices and values are downloaded and compared exactly after each setup.
+  Maximum errors were about1e-15 FP64 and5.21e-7 FP32.
+  CUDA memcheck of b8/k2 passed, ERROR SUMMARY:0 errors.
+Reports: local records of the Hybridge campaign matk.
+
+Final build qualification, passed in 12 s:
+  Repeated20 baseline and80 extended cases: all passed.
+  CUDA memcheck b8/k2: ERROR SUMMARY:0 errors.
+  Five fresh-process C API rejection checks passed: unsorted columns at k0
+  and k2, duplicate columns, missing diagonal, negative fill level. Each
+  returned BAD_PARAMETERS(1) at the expected create/setup operation. Diagnostic
+  stack traces in the log are expected outputs from these negative tests.
+  The baseline library checksum remained unchanged.
+Reports: local records of the Hybridge campaign matk.
+Full matK trials below used the initial qualified library; the final rebuild
+changes only exception propagation and was qualified as above. They have not
+been rerun with that error-path-only rebuild. Allocation-failure fault injection
+was not performed; preservation of those codes is supported by source review.
+
+Full matK trials
+---------------
+Frozen candidate definitions: docs/matk_native_natural_iluk_proposals.json
+(local, untracked) and ../hybridge/campaigns/matk/native_natural_iluk_proposals.json. Actual runtime
+configuration/library hashes are saved per worker.
+Six runs: k1, k2 and k3, each without and with diagonal scaling.
+All use b8 with the saved PARDISO ordering of 2026-10-30,
+restart1000,3000 PFGMRES iterations,
+zero initial guess, no residual corrections. Physical target1e-8 is checked
+against original matK CSR/RHS. Five simultaneous GPU allocations maximum.
+No full convergence result is inferred from qualification.
+
+Completed six full runs (all3000 iterations, original relative L2):
+  k scaling    residual      setup[s]  solve[s]   AMGX peak used[GiB]
+  1 none       0.863051916      0.924    74.084        40.441
+  1 diagonal   2.05150282       0.920    73.755        40.441
+  2 none       0.957581178      1.350    78.168        41.922
+  2 diagonal   3.91681661       1.348    78.602        41.922
+  3 none       0.807156328      1.680    81.486        43.192
+  3 diagonal   1.70814684       1.678    81.456        43.192
+All failed the original-system1e-8 target. The failed exit status records this
+expected numerical rejection, not a crash or setup failure. In these trials,
+higher fill is worse than the earlier b8 ILU0 residual0.1332270818 (2026-10-31).
+ILU(k) without pivoting does not guarantee monotone improvement as k increases;
+the reference-oracle checks establish implementation correctness on their test
+cases, not stability for arbitrary poorly conditioned input.
+
+Every full matrix has9,899,450 original b8 blocks. Expanded factor counts:
+  k1:16,654,100 blocks (1.682326x),7.941294 GiB values,~0.51s host symbolic
+  k2:19,478,850 blocks (1.967670x),9.288240 GiB values,~0.79s host symbolic
+  k3:21,881,800 blocks (2.210406x),10.434056 GiB values,~0.98s host symbolic
+The symbolic timer includes index transfer/validation and is nested in setup.
+The saved PARDISO phase11 analysis took16.459631s with96 CPUs, reused here;
+each run pays~4.4s to apply that permutation and~0.6s to validate it. Those
+operations, scaling and block conversion are nested in preparation time.
+Read detailed non-additive timings in:
+  the local records of the Hybridge campaign matk.
+Concurrent search timings are not isolated performance measurements; sampled
+AMGX memory peaks are neither whole-device nor guaranteed transient maxima.
+
+Commands and monitoring: ../hybridge/campaigns/matk/commands_natural_iluk.txt
+
+Higher-fill follow-up: levels 5, 10 and 20 (2026-10-31)
+----------------------------------------------------
+A stronger ILU was requested, referring to SciPy with fill factor 10 and
+drop tolerance 1e-8. These settings describe threshold dropping, not ILU(10).
+SciPy documents fill_factor as a fill-ratio bound and drop_tol separately:
+https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.linalg.spilu.html
+This AMGX extension has no magnitude-based dropping or pivoting. The follow-up
+therefore stays with AMGX-only higher ILU(k) and tests
+levels 5/10/20; it must not be
+reported as equivalent to spilu(fill_factor=10, drop_tol=1e-8). The benchmark's
+original residual target 1e-8 is also unrelated to a factor drop tolerance.
+
+No AMGX source or library rebuild was needed: the final library above already
+supports these levels. The candidate file and batch launcher now expose them.
+The native allocation bound remains (INT_MAX / b^2) - 1 blocks, including an
+extra sentinel block. For b8 this permits 33,554,430 factor blocks, approximately
+3.39 times the 9,899,450 input blocks. Setup rejects overflow rather than silently
+reducing fill; this limit can be reached before H200 memory is exhausted.
+
+The qualification passed in 2 s: 12/12 GPU reference cases passed.
+The new 32-block fill-chain fixture deliberately generates levels up to 30;
+unpermuted k5/k10/k20 factors have 69/74/84 blocks from 64 input blocks. Thus
+these checks actually exercise the requested high fill, instead of reusing a
+small graph whose pattern has saturated. Cases cover b8, both real precisions,
+original/permuted order, damping, zero/nonzero guesses, coefficient resetup,
+and exact preservation of the original operator. Maximum application errors:
+FP64 8.98365e-16; FP32 3.75240e-7.
+Report: local records of the Hybridge campaign matk.
+
+Full runs initially submitted: k5 (none, diagonal), k10 (none, diagonal)
+and k20 (none).
+All use the earlier PARDISO order, b8, zero initial guess, no residual correction,
+PFGMRES restart1000/max3000, and original-system FP64 acceptance at 1e-8.
+Commands: ../hybridge/campaigns/matk/commands_natural_iluk_high.txt
+
+First converged configuration (2026-10-31)
+-----------------------------------------
+PARDISO + supplied-order b8 ILU(10), PFGMRES restart1000/max3000,
+native tolerance1e-14, no scaling, zero initial guess, no external corrections.
+Original-system relative residual1.6539488781014315e-11, absolute1.7305362e-5;
+1504 iterations, setup3.265s (see authoritative worker for full precision),
+solve43.229735s. AMGX sampled peak used47.035GiB. Physical target1e-8 passed.
+The earlier native tolerance1e-10 stopped prematurely at592 iterations with
+true residual2.52873e-8. Tighter stopping allows the native restart/recomputed
+residual to continue the solve; shorter restart200 instead stalled at3.01898e-2.
+This does not remove the FGMRES native-versus-true residual issue in TODO.md.
+
+The exact config is tracked as
+../hybridge/campaigns/matk/converged_pardiso_ilu10_fgmres.json. Its provenance
+and the saved solution are in the local records of the Hybridge campaign matk.
+The solution is FP64 in original coordinates, with checked vector checksum.
+It is archived for reuse but was not used as an initial guess in any trial here.
+Reproduce from ../hybridge/campaigns/matk:
+  sbatch amgx_natural_iluk.sbatch 10 none 1000 1e-14
+
+Reliable PGMRES follow-up:
+  GMRES already implements gmres_reorthogonalization=ALWAYS and
+  gmres_reliable_residual=1 in this fork. Source gmres_solver.cu explicitly
+  verifies b-Ax before accepting convergence and restarts if needed. ILU is a
+  fixed one-application preconditioner, so this comparison is valid.
+  The first two runs stopped in the benchmark's old FGMRES-only guard before setup;
+  they are not AMGX numerical failures. The guard now also permits GMRES with
+  one fixed ILU application. The reruns perform matching smokes first.
+  Those reruns failed numerically on the 320-unknown smoke: relative residuals
+  4.389095e8/5.996543e8 after100 iterations, none/diagonal scaling. No full runs
+  followed. This potential integration/numerical issue is recorded in TODO.md;
+  no root cause has been established. PFGMRES remains the qualified winner.
+
+Paired with/without PARDISO comparison
+------------------------------------
+A direct ordering comparison followed. The new input-order
+candidate explicitly opts into consecutive_input_blocks; the original
+consecutive_pardiso_blocks flag still requires PARDISO. These mutually exclusive
+flags share the exact BSR count, sorted-column, matvec and memory checks.
+Actual generated AMGX configs, block size8 and library hashes are identical.
+Both cases use PFGMRES restart1000/max3000, native tolerance1e-14, no scaling,
+zero starts and no external residual corrections. Input-order RHS/solution
+remain in original coordinates; the PARDISO case uses the checked saved map.
+The measured effect includes changed block membership because consecutive b8
+groups are formed in each ordering. It does not isolate scalar elimination
+order while holding the block partition fixed.
+Launcher: ../hybridge/campaigns/matk/amgx_iluk_ordering_compare.sbatch pardiso|none
+
+Actual pair: one PARDISO run and one input-order run. An initial input-order
+submission exited in CLI
+argument parsing because the driver's unpermuted option is named natural, not
+none. The launcher maps its none argument to --ordering natural; no numerical
+work ran in it. Both actual runs passed their matching small checks.
+The PARDISO run reproduced the earlier convergence exactly:1504 iterations,
+original relative residual1.6539488781014315e-11, setup3.265s, solve42.942s.
+
+The input-order run FAILED during symbolic ILU setup. The exact diagnostic is
+"Natural ILU fill exceeds the factor storage bound". It exceeded33,554,430 b8
+blocks, the current signed32 scalar-value bound; it did NOT exhaust H200 memory.
+The guard fired before expanded GPU factor allocation and numerical factorization.
+Last reported symbolic progress was49,152/200,050 rows with3,226,692 retained
+blocks; subsequent rows exceeded the cap before the next16,384-row progress
+message. The complete input-order factor count was not computed and no solve
+ran. Do not report this as divergence, a numerical zero pivot, or hardware OOM.
+
+  Metric                           PARDISO             Input order
+  Input b8 blocks                      9,899,450             10,472,498
+  Input scalar slots                 633,564,800            670,239,872
+  Original stored entries            633,564,800            633,564,800
+  BSR operator check error                    0                      0
+  ILU(10) factor blocks               29,152,500            >33,554,430
+  Factor values [GiB]                    13.901           not allocated
+  Setup [s]                              3.265                aborted
+  Solve [s]                             42.942                not run
+  Iterations                              1504                not run
+  Original relative residual        1.65395e-11                not run
+
+Actual completed reports confirm identical AMGX config dictionaries, identical
+library SHA and identical original-system SHA; the initial guesses are zero.
+PARDISO permutation application was approximately4.4s, with the prior16.46s
+phase11 analysis reused. It makes this ILU(10) setup feasible within the current
+implementation's bounds, whereas input order exceeds them. This is evidence
+about storage feasibility and successful convergence with ordering; it cannot
+establish an iteration-count speedup against an input-order solve that never ran.
+The b8 partition caveat above still applies.
+Detailed report: docs/matk_iluk_order_comparison_results.txt (local, untracked)
+Reproduction: ../hybridge/campaigns/matk/commands_iluk_ordering_compare.txt
+
+Full high-fill sweep and detailed timings: docs/matk_natural_iluk_high_results.txt
+(local, untracked)

@@ -607,7 +607,9 @@ count_non_zeroes_ilu1_kernel( const int A_num_rows,
         {
             volatile int *status = reinterpret_cast<volatile int *>( wk_status );
 
-            if ( set.has_failed() || *status != 0 )
+            // A failure can become visible to only some lanes between loads.
+            // All lanes must leave together before the next full-warp collective.
+            if ( utils::any(set.has_failed() || *status != 0, 0xffffffffu) )
             {
                 return;
             }
@@ -671,6 +673,8 @@ count_non_zeroes_ilu1_kernel( const int A_num_rows,
                     s_b_colors[warp_id * WARP_SIZE + dest] = b_row_color; // TODO: store an int2 rather than 2 ints of SM35 with 64bit banks.
                 }
 
+                // Publish the compacted row/color lists to the whole warp.
+                utils::syncwarp(0xffffffffu);
                 const int num_rows = __popc( vote );
 
                 // Uniform loop: threads collaborate to load other elements.
@@ -711,6 +715,8 @@ count_non_zeroes_ilu1_kernel( const int A_num_rows,
                         set.insert( item, COUNT_ONLY ? wk_status : NULL );
                     }
                 }
+                // Finish list readers before the next column chunk reuses them.
+                utils::syncwarp(0xffffffffu);
             }
         }
 
@@ -789,7 +795,9 @@ count_non_zeroes_ilu1_kernel( const int A_num_rows,
         {
             volatile int *status = reinterpret_cast<volatile int *>( wk_status );
 
-            if ( set.has_failed() || *status != 0 )
+            // A failure can become visible to only some lanes between loads.
+            // All lanes must leave together before the next full-warp collective.
+            if ( utils::any(set.has_failed() || *status != 0, 0xffffffffu) )
             {
                 return;
             }
@@ -853,6 +861,8 @@ count_non_zeroes_ilu1_kernel( const int A_num_rows,
                     s_b_colors[warp_id * WARP_SIZE + dest] = b_row_color;
                 }
 
+                // Publish the compacted row/color lists to the whole warp.
+                utils::syncwarp(0xffffffffu);
                 const int num_rows = __popc( vote );
 
                 // Uniform loop: threads collaborate to load other elements.
@@ -902,6 +912,8 @@ count_non_zeroes_ilu1_kernel( const int A_num_rows,
                         set.insert( item, COUNT_ONLY ? wk_status : NULL );
                     }
                 }
+                // Finish list readers before the next column chunk reuses them.
+                utils::syncwarp(0xffffffffu);
             }
         }
 

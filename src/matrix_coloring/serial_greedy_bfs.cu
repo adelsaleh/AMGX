@@ -519,22 +519,26 @@ Serial_Greedy_BFS_MatrixColoring<TemplateConfig<AMGX_device, V, M, I> >::run_cre
         std::stable_sort(index_colors.begin(), index_colors.end());
     }
 
-    int prev = -1;
+    int next_color = 0;
 
     for (int i = 0; i < num_rows; i++)
     {
         sorted_rows_by_color[i] = index_colors[i].index;
         int col = index_colors[i].color;
 
-        if (col != prev)
+        // BFS may skip color IDs at the fixed-size color-window boundary.
+        // Empty colors need the same lower-bound offset as the next present
+        // color; leaving zero here creates negative per-color row counts.
+        while (next_color <= col)
         {
-            offsets_rows_per_color[col] = i;
+            offsets_rows_per_color[next_color++] = i;
         }
-
-        prev = col;
     }
 
-    offsets_rows_per_color[this->m_num_colors] = num_rows;
+    while (next_color <= this->m_num_colors)
+    {
+        offsets_rows_per_color[next_color++] = num_rows;
+    }
     this->m_offsets_rows_per_color.resize(this->m_num_colors + 1);
 
     for (int i = 0; i < this->m_num_colors + 1; i++)

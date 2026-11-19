@@ -63,3 +63,20 @@ legacy/PTDS/nonblocking producer and independent consumer ordering, pointer
 identity before/after setup and solve, independent residuals, unchanged CSR
 contents, owner retention and safe error cleanup, representative AMG setup, and
 Nsight confirmation that attachment/solve never stage the fine CSR arrays.
+
+## Borrowed square-block BSR
+
+`AMGX_matrix_attach_bsr` extends the CSR contract to square blocks. Its `n` and
+`nnz` arguments count block rows and blocks; row pointers and column indices are
+canonical int32 block indices, and values have block-row-major layout. Every
+block row must contain a diagonal block. Dimensions and value counts are checked
+against the internal signed-short block size and signed-int scalar indexing
+before attachment. No missing blocks are inserted and values are not copied.
+
+The ownership, stream, detach and setup restrictions above also apply. The
+qualified native BSR fixture covers FP32/FP64 pointer identity, solve accuracy,
+unchanged values and invalid dimensions/capacities; dDFI attachment is checked
+but retains the existing unsupported mixed-precision solve behavior. Run
+`amgx_tests_launcher BorrowedBSR BorrowedCSR BorrowedVectors` after rebuilding.
+The combined CUDA 13.1/H200 qualification is recorded in
+[the integration validation report](h200_integration_validation.md).

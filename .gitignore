@@ -9,3 +9,10 @@ core/src/version.cu
 ci/docker/
 install
 Release
+
+# Working journal of the matK investigation and machine-readable qualification records:
+# they name local paths and jobs and stay on the machine that produced them.
+/docs/matk_*
+!/docs/matk_natural_iluk.txt
+/docs/h200_integration_validation.json
+/docs/truncation_qualification.json

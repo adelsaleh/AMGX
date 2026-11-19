@@ -15,7 +15,7 @@
 #include <iostream>
 
 // This test runs the same smoother for the same matrix with DIAG=true and DIAG=false.
-// It covers supported block sizes 1-5 and checks that the result remains finite.
+// It covers the supported block sizes 1-10 and checks that the result remains finite.
 
 namespace amgx
 {
@@ -191,7 +191,7 @@ void run()
     std::stringstream err_msg;
     int mat_size = 1000;
 
-    for (int i = 1; i <= 5; i++)
+    for (int i = 1; i <= 10; i++)
     {
         /*err_msg << "block jacobi, block_size= " << i ;
           check_block_smoothers_random(i, mat_size*i, "BLOCK_JACOBI", n_smoothing_steps,done) ;

@@ -6,6 +6,16 @@ CUDA kernels. The implementation is deliberately opt-in until every supported
 block dimension passes the correctness and application-level performance gates
 below.
 
+**Current status (2026-10-31): experimental and explicitly opt-in.** The
+`cusparse_legacy` backend now also has a
+[supplied-order ILU(k) extension](../docs/matk_natural_iluk.txt), distinct from
+the native color-ordered ILU(0/1) path discussed in the historical plan below.
+Automatic architecture tuning of that extension is deferred; the extension
+was merged as an opt-in path after its qualification runs finished.
+Existing backend selection, fill, ordering, precision and tolerances remain
+unchanged. The native synchronization corrections have their own
+[bounded qualification record](../docs/ilu_synchronization_qualification.md).
+
 ## Scope and invariants
 
 For HDG advection of polynomial order `p`, the trace matrix has dense face

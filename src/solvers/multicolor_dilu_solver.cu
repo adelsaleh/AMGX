@@ -3355,6 +3355,26 @@ void DILU_forward_NxN_dispatch( const int *__restrict A_rows,
                 has_external_diag );
             break;
 
+        case 6:
+            DILU_forward_NxN_dispatch_large<Matrix_type, Vector_type, 6>(
+                A_rows,
+                A_cols,
+                A_vals,
+                A_diag,
+                x,
+                b,
+                delta,
+                sorted_rows_by_color,
+                num_rows_per_color,
+                current_color,
+                row_colors,
+                Einv,
+                boundary_coloring,
+                boundary_index,
+                row_major,
+                has_external_diag );
+            break;
+
         case 7:
             DILU_forward_NxN_dispatch_large<Matrix_type, Vector_type, 7>(
                 A_rows,
@@ -3377,6 +3397,26 @@ void DILU_forward_NxN_dispatch( const int *__restrict A_rows,
 
         case 8:
             DILU_forward_NxN_dispatch_large<Matrix_type, Vector_type, 8>(
+                A_rows,
+                A_cols,
+                A_vals,
+                A_diag,
+                x,
+                b,
+                delta,
+                sorted_rows_by_color,
+                num_rows_per_color,
+                current_color,
+                row_colors,
+                Einv,
+                boundary_coloring,
+                boundary_index,
+                row_major,
+                has_external_diag );
+            break;
+
+        case 9:
+            DILU_forward_NxN_dispatch_large<Matrix_type, Vector_type, 9>(
                 A_rows,
                 A_cols,
                 A_vals,
@@ -3697,6 +3737,25 @@ void DILU_backward_NxN_dispatch( const int *__restrict A_rows,
                 row_major );
             break;
 
+        case 6:
+            DILU_backward_NxN_dispatch_large<Matrix_type, Vector_type, WeightType, 6, 2>(
+                A_rows,
+                A_cols,
+                A_vals,
+                x,
+                weight,
+                sorted_rows_by_color,
+                row_colors,
+                Einv,
+                delta,
+                Delta,
+                num_rows_per_color,
+                current_color,
+                boundary_coloring,
+                boundary_index,
+                row_major );
+            break;
+
         case 7:
             DILU_backward_NxN_dispatch_large<Matrix_type, Vector_type, WeightType, 7, 2>(
                 A_rows,
@@ -3718,6 +3777,25 @@ void DILU_backward_NxN_dispatch( const int *__restrict A_rows,
 
         case 8:
             DILU_backward_NxN_dispatch_large<Matrix_type, Vector_type, WeightType, 8, 2>(
+                A_rows,
+                A_cols,
+                A_vals,
+                x,
+                weight,
+                sorted_rows_by_color,
+                row_colors,
+                Einv,
+                delta,
+                Delta,
+                num_rows_per_color,
+                current_color,
+                boundary_coloring,
+                boundary_index,
+                row_major );
+            break;
+
+        case 9:
+            DILU_backward_NxN_dispatch_large<Matrix_type, Vector_type, WeightType, 9, 3>(
                 A_rows,
                 A_cols,
                 A_vals,
@@ -4073,6 +4151,19 @@ void MulticolorDILUSolver<TemplateConfig<AMGX_device, V, M, I> >::computeEinv_Nx
                     i );
                 break;
 
+            case 6:
+                DILU_setup_NxN_kernel_large<ValueTypeA, ValueTypeB, 6, CTA_SIZE, 32, 2> <<< GRID_SIZE, CTA_SIZE, 0, stream>>>(
+                    A.row_offsets.raw(),
+                    A.col_indices.raw(),
+                    A.diag.raw(),
+                    A.values.raw(),
+                    this->Einv.raw(),
+                    A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,
+                    A.getMatrixColoring().getRowColors().raw(),
+                    num_rows_per_color,
+                    i );
+                break;
+
             case 7:
                 DILU_setup_NxN_kernel_large<ValueTypeA, ValueTypeB, 7, CTA_SIZE, 32, 2> <<< GRID_SIZE, CTA_SIZE, 0, stream>>>(
                     A.row_offsets.raw(),
@@ -4088,6 +4179,19 @@ void MulticolorDILUSolver<TemplateConfig<AMGX_device, V, M, I> >::computeEinv_Nx
 
             case 8:
                 DILU_setup_NxN_kernel_large<ValueTypeA, ValueTypeB, 8, CTA_SIZE, 32, 2> <<< GRID_SIZE, CTA_SIZE, 0, stream>>>(
+                    A.row_offsets.raw(),
+                    A.col_indices.raw(),
+                    A.diag.raw(),
+                    A.values.raw(),
+                    this->Einv.raw(),
+                    A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,
+                    A.getMatrixColoring().getRowColors().raw(),
+                    num_rows_per_color,
+                    i );
+                break;
+
+            case 9:
+                DILU_setup_NxN_kernel_large<ValueTypeA, ValueTypeB, 9, CTA_SIZE, 32, 3> <<< GRID_SIZE, CTA_SIZE, 0, stream>>>(
                     A.row_offsets.raw(),
                     A.col_indices.raw(),
                     A.diag.raw(),
@@ -4296,6 +4400,16 @@ void MulticolorDILUSolver<TemplateConfig<AMGX_device, V, M, I> >::smooth_NxN( co
                         num_rows_per_color );
                     break;
 
+                case 6:
+                    DILU_backward_NxN_kernel_skip<ValueTypeA, ValueTypeB, WeightType, 6, CTA_SIZE> <<< GRID_SIZE, CTA_SIZE>>>(
+                        x.raw(),
+                        this->weight,
+                        A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,
+                        this->m_delta.raw(),
+                        this->m_Delta.raw(),
+                        num_rows_per_color );
+                    break;
+
                 case 7:
                     DILU_backward_NxN_kernel_skip<ValueTypeA, ValueTypeB, WeightType, 7, CTA_SIZE> <<< GRID_SIZE, CTA_SIZE>>>(
                         x.raw(),
@@ -4308,6 +4422,16 @@ void MulticolorDILUSolver<TemplateConfig<AMGX_device, V, M, I> >::smooth_NxN( co
 
                 case 8:
                     DILU_backward_NxN_kernel_skip<ValueTypeA, ValueTypeB, WeightType, 8, CTA_SIZE> <<< GRID_SIZE, CTA_SIZE>>>(
+                        x.raw(),
+                        this->weight,
+                        A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,
+                        this->m_delta.raw(),
+                        this->m_Delta.raw(),
+                        num_rows_per_color );
+                    break;
+
+                case 9:
+                    DILU_backward_NxN_kernel_skip<ValueTypeA, ValueTypeB, WeightType, 9, CTA_SIZE> <<< GRID_SIZE, CTA_SIZE>>>(
                         x.raw(),
                         this->weight,
                         A.getMatrixColoring().getSortedRowsByColor().raw() + color_offset,

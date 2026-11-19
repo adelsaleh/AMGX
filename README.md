@@ -4,7 +4,8 @@
 
 The `hdg-cuda13-integration` branch extends `main` with:
 
-- **Borrowed GPU buffers:** `AMGX_matrix_attach_csr` and `AMGX_vector_attach`
+- **Borrowed GPU buffers:** `AMGX_matrix_attach_csr`, `AMGX_matrix_attach_bsr`
+  and `AMGX_vector_attach`
   share caller-owned device storage, with detach and pointer-query APIs.
   Solutions are written directly into the attached output allocation.
 - **Safe synchronous attachment:** producer-stream ordering, ownership checks,
@@ -13,8 +14,9 @@ The `hdg-cuda13-integration` branch extends `main` with:
 - **Solver diagnostics:** live/reserved/peak device-memory counters, improved
   residual reporting, and interval-controlled solve statistics.
 - **Experimental block-system extensions:** block-aware classical AMG,
-  optional CUDA 13 generic BSR SpMV, and a legacy-cuSPARSE block ILU(0)
-  reference backend.
+  optional CUDA 13 generic BSR SpMV, DILU blocks 1–10, and supplied-order
+  cuSPARSE block ILU(k) with host symbolic fill and GPU numeric factors.
+  See the [ILU(k) contract and evidence](docs/matk_natural_iluk.txt).
 - **Experimental convergence checks:** residual-growth monitoring with
   configurable patience/grace and independent residual checks on suspected
   divergence.
@@ -26,10 +28,19 @@ These experimental paths have limited, configuration-specific validation;
 they are not general robustness or performance recommendations. See
 [downstream changes](LOCAL_CHANGES.md) for the fixes, options, and evidence.
 
+Supplied-order ILU(k) remains explicitly selected through
+`block_ilu_backend=cusparse_legacy`. Automatic architecture tuning for that
+experimental extension was deferred on 2026-10-31.
+The separately [qualified native ILU(0/1) synchronization fixes](docs/ilu_synchronization_qualification.md)
+preserve the existing inverse and relaxation policies; they do not promote
+supplied-order ILU(k) to a default solver or preconditioner.
+
 Borrowed CSR is qualified for single-GPU square scalar matrices with canonical
 int32 indices, explicit diagonal entries, and FP32/FP64 values (`dFFI`/`dDDI`).
-Borrowed BSR, distributed storage, and mixed-precision solves are outside this
-qualified contract. Internal solver workspaces and AMG coarse levels still
+Borrowed square-block BSR extends the same ownership contract through a separate
+API; see its [requirements](docs/borrowed_csr.md#borrowed-square-block-bsr).
+Distributed storage and mixed-precision solves remain outside this qualification.
+Internal solver workspaces and AMG coarse levels still
 allocate memory; attachment does not transfer ownership of caller buffers.
 
 Reuse solver setup for changing RHS. After in-place coefficient changes, call

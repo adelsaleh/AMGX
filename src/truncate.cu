@@ -844,7 +844,11 @@ void Truncate<TemplateConfig<AMGX_device, t_vecPrec, t_matPrec, t_indPrec> >::tr
 #else
     cudaCheckError();
 
-    truncate_kernel <<< 4096, blocksize>>>(
+    // Each thread owns max_elmts entries in each 1024-element shared array.
+    // Keep the original launch for <=8 entries; larger caps need fewer threads.
+    // Row-sum/scale launches below retain their original blocksize.
+    const int truncate_blocksize = max_elmts <= 8 ? 128 : (max_elmts <= 16 ? 64 : 32);
+    truncate_kernel <<< 4096, truncate_blocksize>>>(
         A.row_offsets.raw(),
         A.col_indices.raw(),
         A.values.raw(),

@@ -418,7 +418,7 @@ inline void registerParameters()
     block_ilu_backend_values.push_back("cusparse_legacy");
     AMG_Config::registerParameter<std::string>(
         "block_ilu_backend",
-        "MULTICOLOR_ILU implementation <amgx|cusparse_legacy>; the legacy cuSPARSE path is an opt-in natural-order BSR ILU(0) oracle",
+        "MULTICOLOR_ILU implementation <amgx|cusparse_legacy>; cusparse_legacy preserves supplied block order with host ILU(k) symbolic fill and GPU numeric factors",
         "amgx", block_ilu_backend_values);
     //Richardson's iteration - GS
     AMG_Config::registerParameter<int>("symmetric_GS", "Flag to control if GS smoother is symmetric or not <0|1>", 0);

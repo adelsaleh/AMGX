@@ -11,6 +11,152 @@ The upstream comparison point for the current branch is `upstream/main` at
 
 ## Applied changes
 
+### Combined H200 integration (2026-10-31)
+
+The working-tree changes below are integrated together in a fresh CUDA 13.1
+sm_90 build, rather than only in the earlier isolated libraries. See
+[the regression record](docs/h200_integration_validation.md) for exact coverage
+and inherited limitations. Patch files under `docs/matk_*.patch` retain their
+historical proposals; the entries below identify which are now applied and
+qualified. A patch file's presence alone does not establish its runtime status.
+
+- Borrowed square-block BSR extends the existing CSR ownership/stream contract
+  through `AMGX_matrix_attach_bsr`, with canonical structure and explicit block
+  diagonals. Bounds checks reject overflowing block sizes/scalar counts before
+  buffer access; native invalid-input cases cover the integration-review fix.
+- Native DILU now includes block sizes 6 and 9. The native smoother checks cover
+  FP32/FP64 sizes 1–10, and independent embedding/convergence tests cover the
+  newly enabled paths.
+- Supplied-order ILU(k), native multicolor capacity dispatch, CSR row-length
+  reduction and empty BFS color-boundary corrections are built together.
+  Existing numerical and synchronization limitations remain tracked in TODO.md.
+
+### Experimental supplied-order cuSPARSE ILU(k) (2026-10-31)
+
+- This remains an explicitly selected experimental backend after the merge.
+  Automatic architecture tuning was deferred on 2026-10-31;
+  existing arithmetic, fill/order settings and the opt-in selector are unchanged.
+
+- `block_ilu_backend=cusparse_legacy` now accepts nonnegative
+  `ilu_sparsity_level`: a host symbolic elimination pass builds the exact ILU(k)
+  block pattern in the supplied order, then existing GPU cuSPARSE routines
+  factor and apply it. The original operator remains separate from private
+  factor storage. There is no pivoting, graph coloring, or new global ordering.
+- Existing native multicolor ILU(1) remains unchanged. The extension is in
+  `include/solvers/natural_ilu_pattern.h` and the legacy branch of
+  `src/solvers/multicolor_ilu_solver.cu`. Canonical sorted input, internal
+  diagonals, single-GPU operation and signed32 allocation bounds are enforced.
+- An isolated build that recompiled only `multicolor_ilu_solver.cu` preserves the
+  baseline and excludes previous experimental multicolor capacity changes.
+  No C API or class-layout change and no pyamgx rebuild are required.
+- Qualification:600 CPU symbolic comparisons;20 baseline ILU0 and80 extended
+  GPU cases across five block sizes, k0..3, FP64/FP32, permutations, nonzero
+  guesses, damping and coefficient resetup; exact original-operator integrity
+  checks; CUDA memcheck zero errors; five C API input-rejection checks. Final
+  error-path review preserves existing AMGX exception codes. Six full matK
+  initial trials at k1/2/3 with/without diagonal scaling did not converge.
+  Follow-up k5/10/20 reference tests passed; PARDISO+b8 ILU10/PFGMRES with
+  restart1000 and native tolerance1e-14 converged from zero to an original-system
+  relative residual1.65e-11 (2026-10-31). Reliable PGMRES alternatives failed small
+  checks and are tracked separately in TODO.md. See [design and results](docs/matk_natural_iluk.txt) and downstream
+  `../hybridge/campaigns/matk/commands_natural_iluk.txt`.
+
+### Native ILU synchronization and optional inverse diagnostics (2026-10-31)
+
+- The synchronization change of 2026-10-31 orders shared publication/reuse in A-to-LU mapping,
+  factorization, inverse tiles, symbolic ILU1 broadcasts and triangular
+  application. Application masks follow independent 16-lane row ownership.
+  Discarded odd-pair source-list reads are avoided; symbolic failure exits are
+  warp-uniform. No common header, C API or numerical policy changes.
+- Optional `print_coloring_info` counters report inverted blocks, determinant
+  fallbacks, exact-zero determinants and nonfinite determinants. Diagnostics
+  default off; no counter allocation/atomic/copy/summary occurs when disabled.
+  All 16 enabled/disabled numerical comparisons were bitwise identical.
+- H200 qualification runs of 2026-10-31 passed four smoke stages, 28 capacity cases,
+  40 native application/diagnostic cases, 40 synccheck invocations and 32
+  racecheck invocations with zero warnings/errors. Both real precisions and
+  layouts, external diagonals, 8193 paired inverses and 16385 rows per color
+  were exercised. [Exact identities and limits](docs/ilu_synchronization_qualification.md)
+  distinguish these corrections from experimental supplied-order ILU(k).
+- Symbolic subwarp widths 2/4/8/16 and deliberately induced hash-failure exits
+  remain source-reviewed/compiled but not GPU-qualified. Further qualification
+  was stopped after these runs. Complex/distributed execution,
+  nonunit damping, determinant-scaling policy and extreme index limits retain
+  their separate evidence limits and TODO entries.
+
+### Bounded CLASSICAL interpolation truncation (2026-10-31)
+
+- The truncation change of 2026-10-31 bounds the fallback
+  `truncateByMaxElements` launch to its 1024-entry shared arrays: 128 threads
+  for caps 1–8, 64 for 9–16, and 32 for 17–32. Coefficient selection, stable
+  ties, CSR output and row rescaling retain their existing operations.
+- The H200 qualification of 2026-10-31 passed all 191 checks plus the three registered native real
+  modes (828 fixture comparisons). This includes an independent CPU oracle
+  for every cap 1–32 in dDDI/dDFI/dFFI, 24 bitwise safe-cap comparisons, eight
+  reproduced baseline faults, 24 zero-error memchecks and 15 zero-error
+  syncchecks. [Exact evidence and limits](docs/truncation_qualification.md)
+  cover partial blocks, grid strides, signed values, ties and cancellation.
+- This qualifies the H200 direct operator. Full-matK convergence and attribution
+  of earlier AMG hierarchy failures remain unestablished. Host/complex and
+  cap-above-32 rejection contracts are unchanged; no new nonpositive-cap or
+  empty-matrix semantics, experimental preprocessing behavior, or
+  Quadro/Blackwell qualification is claimed.
+
+### Native ILU row-capacity extension (historical qualification sequence)
+
+- Native 4x4 ILU now preflights the filled LU row lengths and selects a 128- or
+  1024-column numeric workspace before factorization. The arithmetic and color
+  order are unchanged; there is no retry on partially factored values. Larger
+  rows are rejected with their required capacity. Legacy cuSPARSE ILU is unchanged.
+- An isolated build recompiles only `multicolor_ilu_solver.cu` and links the
+  other baseline objects unchanged. Source snapshots, the patch, compiler output
+  and library hashes are retained with that build; the baseline library hash is checked before and after.
+- Compiled FP64 1024-column kernels use 18,432 bytes of shared memory and no
+  register spills. GPU regression covers both layouts/precisions, 128/129/1024
+  boundaries, rejection at 1025, and a fill-generated 129-column ILU(1) row.
+  See `../hybridge/campaigns/matk/check_ilu_capacity.py` and
+  the source/runtime audit (`docs/matk_native_krylov_findings.txt`, local, untracked).
+- At this initial stage, independent residual checks exposed separate
+  backend-selection and column-major precision issues tracked in `TODO.md`;
+  a smoke pass is not a claim of full-matK convergence.
+- The first isolated build exposed a pre-existing matrix-reordering defect at
+  high row degree. `matrix.cu` now reduces row indices and explicitly reads
+  adjacent CSR offsets; it no longer takes the address of a reduction argument
+  and assumes the next offset follows it. A second isolated build
+  replaces these two objects while
+  preserving both older libraries. Its SHA256 is
+  `7ece26037d7a3008d09bfcfd6d2708359e3db974917b6014912c24ecc40a18c8`.
+- A qualification run of 2026-10-30 passed all 20 isolated-build cases (16 numerical
+  checks and four expected capacity rejections) and all 20 baseline outcomes.
+  The previously failing FP64 degree1024 systems now have independent residuals
+  about 2.6e-16 in both layouts, versus about 0.096 before the correction.
+  Both layout variants pass compute-sanitizer memcheck with zero errors.
+  These results qualify the tested capacity paths; full-matK convergence remains
+  unestablished. `matk_native_ilu_capacity_proposals.json` records the next
+  three native configurations, pinned to this qualified library hash.
+- A third isolated build also fixes empty interior BFS color offsets in
+  `serial_greedy_bfs.cu`. A run with the previous build reproduces the old CUDA
+  launch failure in four precision/layout cases; a run with the third build
+  passes all four after the boundary correction (2026-10-30). Its library SHA256
+  is `1c5f728bf6ba0dd6f9b9f2f7d2349607991504ed8390ed56c179e5a3e860a7fb`.
+  The source, build script, compiler output and hashes are preserved separately.
+- Independent audits found inherited determinant-scaling,
+  synchronization and indexing issues, now tracked in `TODO.md`. The
+  one-application inverse test and racecheck of 2026-10-30 demonstrate why
+  end-to-end known-solution and memcheck passes are insufficient to qualify the
+  factors themselves. The numeric cutoff/synchronization kernels are not yet
+  changed in these isolated builds; no claim of universal qualification is made.
+- A fourth, snapshot-only isolated build
+  applies the synchronization patch (`docs/matk_ilu_sync_fix.patch`, local, untracked) to ILU
+  mapping/factorization/local inversion and ILU1 symbolic broadcasts. It leaves
+  production sources and all previous libraries unchanged. The independent
+  review (`docs/matk_ilu_sync_fix_review.txt`, local, untracked) found no source-level blocker and
+  checked 1,600 CPU inverse/layout cases. The existing determinant cutoff and
+  index-width limits remain unchanged. Library SHA256:
+  `0c82515f5ae6ab2fc2248bb9c6606ea261e7f5dd64daa183a42168cae69d563c`.
+  This setup-only build did not complete the GPU qualification gate (see
+  `TODO.md`); no full-matK result is claimed for this new library.
+
 ### Borrowed device vectors and scalar CSR
 
 - Commit: `f73ec35bd08171ba2f25c282af6b3d102025751a`.
@@ -28,7 +174,7 @@ The upstream comparison point for the current branch is `upstream/main` at
   retain the existing unsupported SpMV error; borrowed BSR and distributed
   use are excluded. See [CSR](docs/borrowed_csr.md) and
   [vector](docs/borrowed_vectors.md) contracts.
-- After the user-run build, all three native BorrowedCSR and three
+- After the build, all three native BorrowedCSR and three
   BorrowedVectors regressions passed. Companion PyAMGX records Python/PTDS
   tests, memory checks, and FP32/FP64 transfer profiles. Its `quality-of-life`
   branch exposes these C APIs and the reusable-solver wrapper; the binding
@@ -175,6 +321,31 @@ The upstream comparison point for the current branch is `upstream/main` at
   block-smoother, Chebyshev, interpolation, export, or divergence options.
   Broader numerical and performance validation remains outstanding.
 
+### Multicolor DILU block sizes 6 and 9
+
+- Integrated on `hdg-cuda13-integration` after combined H200 regression checks (2026-10-31).
+- Adds `case 6` and `case 9` to the four block-size switches of
+  `src/solvers/multicolor_dilu_solver.cu`: setup (`DILU_setup_NxN_kernel_large`,
+  2 and 3 warp iterations per block), forward and backward
+  (`DILU_*_NxN_dispatch_large`), and the last-colour `DILU_backward_NxN_kernel_skip`.
+  The `_large` kernels are generic in N; blocks 6 and 9, like 7, do not divide the warp,
+  which the 7096fa2 shuffle guards already handle. The sizes follow HDG BSR
+  blocks p+1 for p=5 and p=8, which previously aborted with "block size was not
+  enabled".
+- `src/tests/smoother_blocksizes.cu` now covers block sizes 1-10 (finite result,
+  DIAG on/off agreement). The combined build passes dDDI/dFFI; dDFI
+  retains the prior cuSPARSE mixed-precision rejection.
+- First built in an isolated build that recompiled only this one file with
+  the flags of the primary build and relinked, without writing to the primary
+  build tree. sm_90 ptxas:
+  38-40 registers at FP64, no spills for 6 and 9 (the existing block-10 setup
+  kernel spills).
+- Original validation entry point: H200 stage `slv-03-dilu69`
+  (`../hybridge/campaigns/gpu_lane/stages/amgx_dilu_check.sh`). It checks
+  embedding parity (block b against b+1 with a decoupled identity component),
+  FGMRES+DILU convergence, and bitwise identity with the production library on
+  1-5, 7, 8, 10. It then reruns the Hybridge campaign cases that had aborted on these block sizes.
+
 ## Configuration contract
 
 Place `bsr_spmv_backend` in the outer BICGSTAB/PBICGSTAB solver object when it
@@ -218,4 +389,4 @@ change the scalar SpMV route. BSR block dimensions are supplied by the caller vi
 When adding another downstream patch, record its commit (or mark it pending),
 the numerical/configuration contract, affected public interfaces, CUDA/version
 constraints, regression coverage, validation state, and cross-repository work
-required in `hdg` or `pyamgx`.
+required in `hybridge` or `pyamgx`.

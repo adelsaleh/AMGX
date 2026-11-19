@@ -26,11 +26,13 @@ set(tests_all ${tests_all}
     tests/device_memory_stats.cu
     tests/borrowed_vectors.cu
     tests/borrowed_csr.cu
+    tests/borrowed_bsr.cu
     tests/gmres_reliable_residual.cu
     tests/bicgstab_residual.cu
     tests/krylov_bsr_spmv_backend.cu
     tests/block_ilu_backend.cu
     tests/smoother_blocksizes.cu
+    tests/truncate_max_elements.cu
     tests/dense_lu.cu)
 
 add_library(amgx_tests_libs OBJECT ${tests_all})

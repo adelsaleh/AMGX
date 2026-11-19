@@ -50,8 +50,11 @@ AMGX_RC borrowed_matrix_operation(AMGX_matrix_handle handle,
         BorrowedMatrixOperation op, int n, int nnz, int *rows, int *cols, void *data,
         size_t rows_bytes, size_t cols_bytes, size_t data_bytes,
         uintptr_t rows_stream, uintptr_t cols_stream, uintptr_t data_stream,
-        void **out_rows, void **out_cols, void **out_data)
+        void **out_rows, void **out_cols, void **out_data,
+        int block_dimx = 1, int block_dimy = 1)
 {
+    // block_dimx = block_dimy > 1: borrowed square-block BSR. The row structure and its
+    // validation are per block row; the values buffer holds nnz * block_dimx * block_dimy entries.
     using Config = typename TemplateMode<CASE>::Type;
     using Mat = Matrix<Config>;
     using Value = typename Mat::value_type;
@@ -64,12 +67,18 @@ AMGX_RC borrowed_matrix_operation(AMGX_matrix_handle handle,
     struct Restore { int device; ~Restore() { cudaSetDevice(device); } } restore{previous};
     if (op == BorrowedMatrixOperation::attach)
     {
-        if (n <= 0 || n == INT_MAX || nnz < n || A.is_initialized() ||
+        // Vector block sizes use signed short and scalar offsets use signed int.
+        // Check before multiplying dimensions or inspecting the supplied buffers.
+        if (block_dimx <= 0 || block_dimy <= 0 || block_dimx != block_dimy ||
+            block_dimx > SHRT_MAX / block_dimy ||
+            n <= 0 || n == INT_MAX || nnz < n ||
+            (block_dimx > 1 && nnz > INT_MAX / (block_dimx * block_dimy) - 1) ||
+            A.is_initialized() ||
             A.get_num_rows() != 0 || A.values.is_borrowed() || A.manager != nullptr ||
             wrap.wrapped().use_count() != 2 ||
             rows_bytes < (static_cast<size_t>(n) + 1) * sizeof(int) ||
             cols_bytes < static_cast<size_t>(nnz) * sizeof(int) ||
-            data_bytes < static_cast<size_t>(nnz) * sizeof(Value) ||
+            data_bytes < static_cast<size_t>(nnz) * block_dimx * block_dimy * sizeof(Value) ||
             !borrowed_csr_pointer(rows, rows_bytes, alignof(int), device) ||
             !borrowed_csr_pointer(cols, cols_bytes, alignof(int), device) ||
             !borrowed_csr_pointer(data, data_bytes, alignof(Value), device))
@@ -77,7 +86,8 @@ AMGX_RC borrowed_matrix_operation(AMGX_matrix_handle handle,
         const uintptr_t ptrs[] = {reinterpret_cast<uintptr_t>(rows),
             reinterpret_cast<uintptr_t>(cols), reinterpret_cast<uintptr_t>(data)};
         const size_t sizes[] = {(static_cast<size_t>(n) + 1) * sizeof(int),
-            static_cast<size_t>(nnz) * sizeof(int), static_cast<size_t>(nnz) * sizeof(Value)};
+            static_cast<size_t>(nnz) * sizeof(int),
+            static_cast<size_t>(nnz) * block_dimx * block_dimy * sizeof(Value)};
         for (int i = 0; i < 3; ++i)
             for (int j = i + 1; j < 3; ++j)
                 if (ptrs[i] < ptrs[j] ? ptrs[j] - ptrs[i] < sizes[i] : ptrs[i] - ptrs[j] < sizes[j])
@@ -131,14 +141,15 @@ AMGX_RC borrowed_matrix_operation(AMGX_matrix_handle handle,
     A.addProps(CSR); A.delProps(COO); A.delProps(DIAG); A.delProps(COLORING);
     A.values.clear(); A.col_indices.clear(); A.row_offsets.clear();
     A.set_num_rows(n); A.set_num_cols(n); A.set_num_nz(nnz);
-    A.set_block_dimx(1); A.set_block_dimy(1);
+    A.set_block_dimx(block_dimx); A.set_block_dimy(block_dimy);
     A.setColsReorderedByColor(false);
     A.set_is_matrix_setup(false);
     try
     {
         A.row_offsets.attach_storage(rows, static_cast<size_t>(n) + 1);
         A.col_indices.attach_storage(cols, nnz);
-        A.values.attach_storage(static_cast<Value *>(data), nnz);
+        A.values.attach_storage(static_cast<Value *>(data),
+            static_cast<size_t>(nnz) * block_dimx * block_dimy);
         A.m_seq_offsets.resize(static_cast<size_t>(n) + 1);
         thrust_wrapper::sequence<AMGX_device>(A.m_seq_offsets.begin(), A.m_seq_offsets.end());
         A.computeDiagonal();
@@ -162,7 +173,8 @@ inline AMGX_RC dispatch_borrowed_matrix(AMGX_matrix_handle handle,
         int *cols = nullptr, void *data = nullptr, size_t rows_bytes = 0,
         size_t cols_bytes = 0, size_t data_bytes = 0, uintptr_t rows_stream = 0,
         uintptr_t cols_stream = 0, uintptr_t data_stream = 0,
-        void **out_rows = nullptr, void **out_cols = nullptr, void **out_data = nullptr)
+        void **out_rows = nullptr, void **out_cols = nullptr, void **out_data = nullptr,
+        int block_dimx = 1, int block_dimy = 1)
 {
     Resources *resources = nullptr;
     AMGX_CHECK_API_ERROR_NORSRC(getAMGXerror(getResourcesFromMatrixHandle(handle, &resources)))
@@ -172,7 +184,7 @@ inline AMGX_RC dispatch_borrowed_matrix(AMGX_matrix_handle handle,
     {
         switch (get_mode_from<AMGX_matrix_handle>(handle))
         {
-#define AMGX_CASE_LINE(CASE) case CASE: result = borrowed_matrix_operation<CASE>(handle, op, n, nnz, rows, cols, data, rows_bytes, cols_bytes, data_bytes, rows_stream, cols_stream, data_stream, out_rows, out_cols, out_data); break;
+#define AMGX_CASE_LINE(CASE) case CASE: result = borrowed_matrix_operation<CASE>(handle, op, n, nnz, rows, cols, data, rows_bytes, cols_bytes, data_bytes, rows_stream, cols_stream, data_stream, out_rows, out_cols, out_data, block_dimx, block_dimy); break;
             AMGX_FORALL_BUILDS_DEVICE(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
             default: return AMGX_RC_BAD_MODE;
